@@ -23,6 +23,10 @@ targets:
     deploymentTarget: "17.0"
     sources:
       - path: Podium
+    # Lets debugserver take the task port. A development profile accepts
+    # this; a distribution profile will refuse to sign the app.
+    entitlements:
+      path: Podium.entitlements
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.leviidev.podium
