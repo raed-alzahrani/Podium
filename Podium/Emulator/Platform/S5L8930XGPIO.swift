@@ -81,8 +81,24 @@ final class S5L8930XGPIO: MMIODevice {
     func setInputLevel(_ level: Bool, pin: Int) {
         let previous = inputLevels[pin]
         inputLevels[pin] = level
-        guard previous != level else { return }
         let mode = registers[pin] & 0xE
+        // The digitizer holds GPIO 21 low for the whole queued frame and
+        // calls this again for every new packet. A falling-edge detect
+        // that already saw the first edge would otherwise stay clear
+        // (`pending=false`) while the pin sat low, and the guest would
+        // never come back to the FIFO. Holding the line low keeps the
+        // latch set; releasing it drops the latch.
+        if pin == Pin.touchInterrupt, mode == 0xA || mode == 0x6 {
+            let bit = UInt32(1) << UInt32(pin % 32)
+            if level {
+                status[pin / 32] &= ~bit
+            } else {
+                status[pin / 32] |= bit
+            }
+            updateInterruptLine()
+            return
+        }
+        guard previous != level else { return }
         let triggered: Bool
         switch mode {
         case 0xC: triggered = true
@@ -143,10 +159,15 @@ final class S5L8930XGPIO: MMIODevice {
     }
 
     /// A level-triggered interrupt stays pending while its level holds.
+    /// The touch line is falling-edge in the driver and level-low in
+    /// effect: acknowledging the status bit while ATN is still low
+    /// brings the VIC line straight back.
     private func reassertLevelInterrupt(_ pin: Int) {
         guard let level = inputLevels[pin] else { return }
         let mode = registers[pin] & 0xE
-        if (mode == 0x4 && level) || (mode == 0x6 && !level) {
+        let held = (mode == 0x4 && level) || (mode == 0x6 && !level)
+            || (pin == Pin.touchInterrupt && mode == 0xA && !level)
+        if held {
             status[pin / 32] |= 1 << UInt32(pin % 32)
         }
     }

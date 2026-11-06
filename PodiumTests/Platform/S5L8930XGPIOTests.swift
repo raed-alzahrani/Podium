@@ -51,8 +51,25 @@ final class S5L8930XGPIOTests: XCTestCase {
         gpio.setInputLevel(false, pin: Int(pin))
         XCTAssertTrue(line)
         gpio.writeRegister(1 << pin, at: S5L8930XGPIO.statusBase)
+        XCTAssertTrue(line, "ATN held low keeps the VIC line pending after the guest clears the status bit")
+        gpio.setInputLevel(false, pin: Int(pin))
+        XCTAssertTrue(line, "a later packet latches the line again while it is already low")
         gpio.setInputLevel(true, pin: Int(pin))
         XCTAssertFalse(line)
+    }
+
+    /// ATN often falls before the driver programs the pin. Configuring
+    /// falling-edge mode on a line that is already low has to latch.
+    func testTouchLineLatchesWhenConfiguredWhileAlreadyLow() {
+        var line = false
+        let gpio = S5L8930XGPIO { line = $0 }
+        let pin = UInt32(S5L8930XGPIO.Pin.touchInterrupt)
+        gpio.setInputLevel(false, pin: Int(pin))
+        XCTAssertFalse(line)
+        gpio.writeRegister(0x20A, at: pin * 4)
+        gpio.writeRegister(1 << pin, at: S5L8930XGPIO.enableBase)
+        XCTAssertTrue(line)
+        XCTAssertEqual(gpio.readRegister(at: S5L8930XGPIO.statusBase) & (1 << pin), 1 << pin)
     }
 
     /// A level-low interrupt stays pending while the level holds, even

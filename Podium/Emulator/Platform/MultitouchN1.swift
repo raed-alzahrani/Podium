@@ -262,13 +262,18 @@ final class MultitouchN1: SPISlave {
 
     /// Loads the next frame's length and pulls ATN low for it, unless the
     /// host is between asking something and collecting the answer.
+    ///
+    /// `announcing` staying true must not swallow the next packet. The
+    /// first falling edge is often acknowledged before the driver reads
+    /// the FIFO; every later frame has to latch GPIO 21 again or the VIC
+    /// line stays down and the queue grows forever.
     private func announceIfIdle() {
         guard mode == .firmware, let frame = frames.first else { return }
         // A finished SPI transaction must not keep the attention line idle.
         // The driver only comes back to the FIFO when that line falls, so a
         // stuck "reply not collected" flag would swallow every finger.
         if !selected { answerPending = false }
-        guard !announcing, !answerPending else {
+        guard !selected, !answerPending else {
             note("frame queued (\(frames.count), \(frame.count) bytes) but ATN not raised: announcing=\(announcing) answerPending=\(answerPending) selected=\(selected)")
             return
         }
@@ -276,7 +281,10 @@ final class MultitouchN1: SPISlave {
         reply = Self.packet([0xEA, UInt8(length & 0xFF), UInt8(length >> 8)])
         announcing = true
         setAttention?(true)
-        note("ATN asserted, \(frames.count) frame(s) queued")
+        let status = interruptStatus?() ?? ""
+        if frames.count == 1 || frames.count % 64 == 0 || !status.contains("pending=true") {
+            note("ATN asserted, \(frames.count) frame(s) queued \(status)")
+        }
     }
 
     private func note(_ message: String) {
