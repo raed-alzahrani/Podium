@@ -105,6 +105,27 @@ final class S5L8930XCDMATests: XCTestCase {
         XCTAssertEqual(Array(try memory.readBytes(16, at: 0x500)), plaintext)
     }
 
+    /// Audio's DMA target is not always the transmit FIFO we model. The
+    /// channel still has to report done, or the kernel spins in the wait.
+    func testUnmodeledPeripheralTransferCompletesAndReportsItsBytes() throws {
+        try write([9, 8, 7, 6], at: 0x400)
+        try chain(at: 0x100, command: 0x103, buffer: 0x400, length: 4)
+        var reported: (UInt32, [UInt8])?
+        cdma.unmodeledPeripheralWrite = { reported = ($0, $1) }
+        let channel: UInt32 = 3
+        cdma.writeRegister(0x0450_0410, at: channel << 12 | 0x8)
+        cdma.writeRegister(2, at: channel << 12 | 0x4)
+        cdma.writeRegister(0x100, at: channel << 12 | 0x14)
+        cdma.writeRegister(1 | (1 << 3), at: channel << 12)
+
+        XCTAssertEqual(reported?.0, 0x0450_0410)
+        XCTAssertEqual(reported?.1, [9, 8, 7, 6])
+        let csr = cdma.readRegister(at: channel << 12)
+        XCTAssertEqual(csr & (1 << 19), 1 << 19, "done")
+        XCTAssertEqual(csr & (3 << 16), 0, "no longer running")
+        XCTAssertEqual(lines[0x30 + Int(channel)], true)
+    }
+
     func testChannelEnableBitsReadBack() {
         cdma.writeRegister(0b110, at: 0x0)
         cdma.writeRegister(0b010, at: 0x8)

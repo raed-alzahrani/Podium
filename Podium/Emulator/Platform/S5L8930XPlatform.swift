@@ -120,6 +120,11 @@ final class S5L8930XPlatform: DeviceEventHandler {
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.transmitData)
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.receiveData)
         cdma.attach(i2s0, dataRegister: Self.i2s0Base + S5L8930XI2S.transmitData)
+        cdma.unmodeledPeripheralWrite = { [unowned self] address, bytes in
+            let base = address & ~Self.aliasBit
+            guard base >= Self.i2s0Base, base < Self.i2s0Base + S5L8930XI2S.windowLength else { return }
+            self.i2s0.ingest(bytes)
+        }
         spi1.dmaRequest = { [unowned self] in self.cdma.pumpPeripherals() }
         touch.setAttention = { [unowned self] asserted in
             self.gpio.setInputLevel(!asserted, pin: S5L8930XGPIO.Pin.touchInterrupt)

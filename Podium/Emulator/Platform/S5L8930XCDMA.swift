@@ -92,6 +92,11 @@ final class S5L8930XCDMA: MMIODevice {
     /// Peripheral data registers (physical, without the `0x80000000`
     /// alias) a channel's DAR can name.
     private var endpoints: [UInt32: DMAEndpoint] = [:]
+    /// A memory-to-peripheral transfer whose register has no endpoint.
+    /// The channel is completed in the same call either way: a driver
+    /// waiting on the done interrupt (an audio buffer, for one) must not
+    /// be left running with nothing to finish it.
+    var unmodeledPeripheralWrite: ((UInt32, [UInt8]) -> Void)?
     /// A running peripheral channel: its memory segments and progress.
     private struct PeripheralTransfer {
         let toPeripheral: Bool
@@ -179,7 +184,18 @@ final class S5L8930XCDMA: MMIODevice {
         guard csr & Self.csrMemoryToMemory != 0 else {
             let dataRegister = register(channel, 0x8) & 0x7FFF_FFFF
             guard let endpoint = endpoints[dataRegister] else {
-                log?(String(format: "cdma| channel %d: peripheral register %08x not modeled (csr %08x)", channel, dataRegister, csr))
+                let chain = walkChain(at: register(channel, 0x14))
+                if register(channel, 0x4) & 2 != 0 {
+                    let bus = memory()
+                    var bytes: [UInt8] = []
+                    for segment in chain.segments {
+                        bytes.append(contentsOf: (try? bus.readBytes(segment.length, at: segment.address)) ?? [])
+                    }
+                    unmodeledPeripheralWrite?(dataRegister, bytes)
+                }
+                log?(String(format: "cdma| channel %d: peripheral register %08x completed without a device (%d bytes)", channel, dataRegister, chain.segments.reduce(0) { $0 + $1.length }))
+                setRegister(channel, 0x14, chain.end)
+                finish(channel)
                 return
             }
             // DCR bit 1: memory to peripheral (openiBoot's "out").

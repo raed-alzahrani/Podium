@@ -29,11 +29,19 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
 
     var dmaSpace: Int { 1 << 20 }
     func dmaPush(_ byte: UInt8) {
-        guard transmitting else { return }
         accept(byte)
     }
     var dmaAvailable: Int { 0 }
     func dmaPop() -> UInt8 { 0 }
+
+    /// A whole DMA buffer, played whether or not control bit 0 is set.
+    /// Programmed writes of the transmit register still wait for that bit;
+    /// a DMA submit must both play and finish without waiting for it.
+    func ingest(_ bytes: [UInt8]) {
+        guard !bytes.isEmpty else { return }
+        for byte in bytes { accept(byte) }
+        flush()
+    }
 
     func readRegister(at offset: UInt32) -> UInt32 {
         let value = registers[Int(offset / 4)]
