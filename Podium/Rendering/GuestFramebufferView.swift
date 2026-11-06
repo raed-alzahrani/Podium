@@ -84,11 +84,11 @@ final class FramebufferMetalView: UIView {
             return device.makeSamplerState(descriptor: descriptor)
         }
         super.init(frame: .zero)
-        // This view is the hit target. Leaving interaction off made the
-        // SwiftUI drag gesture miss the screen entirely, so the lock
-        // screen never saw a finger.
         isUserInteractionEnabled = true
-        isMultipleTouchEnabled = false
+        isMultipleTouchEnabled = true
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        layer.cornerRadius = 5
+        layer.masksToBounds = true
         backgroundColor = .black
         metalLayer.device = device
         metalLayer.pixelFormat = .bgra8Unorm
@@ -108,37 +108,32 @@ final class FramebufferMetalView: UIView {
         return try? device.makeRenderPipelineState(descriptor: descriptor)
     }
 
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        if window != nil {
-            guard displayLink == nil else { return }
-            let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
-            link.add(to: .main, forMode: .common)
-            displayLink = link
-        } else {
-            stop()
-        }
-    }
+    private weak var primaryTouch: UITouch?
 
     override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first else { return }
+        guard primaryTouch == nil, let touch = touches.first else { return }
+        primaryTouch = touch
         onTouch?(.touchBegan(devicePoint(touch)))
     }
 
     override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first else { return }
-        onTouch?(.touchMoved(devicePoint(touch)))
+        guard let primaryTouch, touches.contains(primaryTouch) else { return }
+        onTouch?(.touchMoved(devicePoint(primaryTouch)))
     }
 
     override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first else { return }
-        onTouch?(.touchEnded(devicePoint(touch)))
+        endPrimary(ifListedIn: touches)
     }
 
     override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
-        guard let touch = touches.first else { return }
-        onTouch?(.touchEnded(devicePoint(touch)))
+        endPrimary(ifListedIn: touches)
+    }
+
+    private func endPrimary(ifListedIn touches: Set<UITouch>) {
+        guard let primaryTouch, touches.contains(primaryTouch) else { return }
+        let point = devicePoint(primaryTouch)
+        self.primaryTouch = nil
+        onTouch?(.touchEnded(point))
     }
 
     /// A point in this view, in the guest's 640×960 framebuffer pixels.
@@ -151,6 +146,20 @@ final class FramebufferMetalView: UIView {
         let x = min(max(location.x / bounds.width, 0), 1) * Double(GuestMemoryLayout.framebufferWidth)
         let y = min(max(location.y / bounds.height, 0), 1) * Double(GuestMemoryLayout.framebufferHeight)
         return TouchPoint(x: x, y: y, touchID: 0)
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        if window != nil { NavigationPopGestureBlocker.shared.lock(from: self) }
+        if window != nil {
+            guard displayLink == nil else { return }
+            let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.add(to: .main, forMode: .common)
+            displayLink = link
+        } else {
+            stop()
+        }
     }
 
     override func layoutSubviews() {

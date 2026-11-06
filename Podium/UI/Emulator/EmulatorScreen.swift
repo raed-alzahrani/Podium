@@ -33,7 +33,6 @@ struct EmulatorScreen: View {
 
                     screen
                         .frame(width: displayWidth, height: displayHeight)
-                        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .frame(maxHeight: min(geometry.size.height * 0.68, 610))
@@ -143,63 +142,133 @@ struct EmulatorScreen: View {
 
 }
 
-/// The slide-to-unlock drag starts at the left edge, which is also where
-/// `interactivePopGestureRecognizer` claims the touch and pops this
-/// screen. While the emulator is on screen the recognizer is disabled;
-/// leaving the screen puts it back.
-private struct EmulatorPopGestureLock: UIViewRepresentable {
-    func makeCoordinator() -> Coordinator { Coordinator() }
-
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView(frame: .zero)
-        view.isUserInteractionEnabled = false
-        view.isHidden = true
-        return view
+/// Owns the emulator screen for UIKit. SwiftUI's `NavigationStack` keeps
+/// `interactivePopGestureRecognizer` enabled, and a hidden background view
+/// never saw that controller, so an edge swipe popped the screen and
+/// cancelled the digitizer's touches. This controller is in the hosting
+/// hierarchy, so `viewWillAppear` / `viewDidAppear` can reach the real
+/// navigation controller, and `viewWillDisappear` puts the gesture back.
+private struct EmulatorPopGestureLock: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> Controller { Controller() }
+    func updateUIViewController(_ controller: Controller, context: Context) {
+        controller.relock()
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
-        DispatchQueue.main.async { context.coordinator.lock(from: uiView) }
+    final class Controller: UIViewController {
+        private var holding = false
+
+        override func viewDidLoad() {
+            super.viewDidLoad()
+            view.isUserInteractionEnabled = false
+            view.backgroundColor = .clear
+        }
+
+        override func viewWillAppear(_ animated: Bool) {
+            super.viewWillAppear(animated)
+            holding = true
+            relock()
+        }
+
+        override func viewDidAppear(_ animated: Bool) {
+            super.viewDidAppear(animated)
+            holding = true
+            relock()
+        }
+
+        override func viewDidLayoutSubviews() {
+            super.viewDidLayoutSubviews()
+            relock()
+        }
+
+        override func viewWillDisappear(_ animated: Bool) {
+            super.viewWillDisappear(animated)
+            holding = false
+            NavigationPopGestureBlocker.shared.restore(from: self)
+        }
+
+        /// SwiftUI turns the recognizer back on after appear. Layout runs
+        /// again on those updates, so the recognizer cannot stay armed.
+        func relock() {
+            guard holding else { return }
+            NavigationPopGestureBlocker.shared.lock(from: self)
+        }
+    }
+}
+
+/// Refuses the navigation pop gesture while the emulator screen is up.
+/// One instance, because the recognizer's delegate is a single object.
+final class NavigationPopGestureBlocker: NSObject, UIGestureRecognizerDelegate {
+    static let shared = NavigationPopGestureBlocker()
+
+    private struct Saved {
+        weak var recognizer: UIGestureRecognizer?
+        weak var delegate: UIGestureRecognizerDelegate?
+    }
+    private var saved: [ObjectIdentifier: Saved] = [:]
+
+    func lock(from controller: UIViewController) {
+        guard let navigation = Self.navigationController(from: controller) else { return }
+        lock(navigation)
     }
 
-    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) {
-        coordinator.unlock(from: uiView)
+    func lock(from view: UIView) {
+        guard let navigation = Self.navigationController(from: view) else { return }
+        lock(navigation)
     }
 
-    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
-        private weak var recognizer: UIGestureRecognizer?
-        private weak var savedDelegate: UIGestureRecognizerDelegate?
-
-        func lock(from view: UIView) {
-            guard let recognizer = navigationController(from: view)?.interactivePopGestureRecognizer else { return }
-            if self.recognizer !== recognizer {
-                savedDelegate = recognizer.delegate
-                recognizer.delegate = self
-                self.recognizer = recognizer
+    func restore(from controller: UIViewController) {
+        guard let navigation = Self.navigationController(from: controller) else { return }
+        for recognizer in popRecognizers(on: navigation) {
+            let key = ObjectIdentifier(recognizer)
+            guard let previous = saved.removeValue(forKey: key) else { continue }
+            recognizer.isEnabled = true
+            if recognizer.delegate === self {
+                recognizer.delegate = previous.delegate
             }
+        }
+    }
+
+    func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool { false }
+
+    private func lock(_ navigation: UINavigationController) {
+        for recognizer in popRecognizers(on: navigation) {
+            let key = ObjectIdentifier(recognizer)
+            if saved[key] == nil {
+                saved[key] = Saved(recognizer: recognizer, delegate: recognizer.delegate)
+            }
+            recognizer.delegate = self
             recognizer.isEnabled = false
         }
+    }
 
-        func unlock(from view: UIView) {
-            let recognizer = self.recognizer ?? navigationController(from: view)?.interactivePopGestureRecognizer
-            recognizer?.isEnabled = true
-            if recognizer?.delegate === self {
-                recognizer?.delegate = savedDelegate
-            }
-            self.recognizer = nil
+    private func popRecognizers(on navigation: UINavigationController) -> [UIGestureRecognizer] {
+        var recognizers: [UIGestureRecognizer] = []
+        if let pop = navigation.interactivePopGestureRecognizer { recognizers.append(pop) }
+        let contentPop = Selector(("interactiveContentPopGestureRecognizer"))
+        if navigation.responds(to: contentPop), let extra = navigation.value(forKey: "interactiveContentPopGestureRecognizer") as? UIGestureRecognizer {
+            recognizers.append(extra)
         }
+        return recognizers
+    }
 
-        func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool { false }
-
-        private func navigationController(from view: UIView) -> UINavigationController? {
-            var responder: UIResponder? = view
-            while let next = responder {
-                if let controller = next as? UIViewController {
-                    return controller.navigationController
-                }
-                responder = next.next
-            }
-            return nil
+    private static func navigationController(from controller: UIViewController) -> UINavigationController? {
+        var current: UIViewController? = controller
+        while let next = current {
+            if let navigation = next as? UINavigationController { return navigation }
+            if let navigation = next.navigationController { return navigation }
+            current = next.parent
         }
+        return navigationController(from: controller.view)
+    }
+
+    private static func navigationController(from view: UIView) -> UINavigationController? {
+        var responder: UIResponder? = view
+        while let next = responder {
+            if let navigation = next as? UINavigationController { return navigation }
+            if let host = next as? UIViewController, let navigation = host.navigationController { return navigation }
+            responder = next.next
+        }
+        return nil
     }
 }
 
