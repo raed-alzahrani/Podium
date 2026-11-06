@@ -164,6 +164,9 @@ final class EmulatorCore {
                 }
             }
             self.session = session
+            session.platform.touch.traceTouch = { [weak self] message in
+                Task { @MainActor [weak self] in self?.appendLog(message) }
+            }
             framebufferSource = session.display
             rateSamples = [(Date(), 0)]
             bootStage = .booting(fraction: 0, secondsRemaining: nil)
@@ -207,6 +210,10 @@ final class EmulatorCore {
     func retryStorageFlush() {
         guard let session, session.hasStorageFlushFailure else { return }
         powerOff()
+    }
+
+    func log(_ message: String) {
+        appendLog(message)
     }
 
     func sendInput(_ event: InputEvent) {

@@ -14,9 +14,17 @@ struct EmulatorScreen: View {
     @ViewBuilder
     private var screen: some View {
         if emulatorCore.bootStage == .running, let source = emulatorCore.framebufferSource {
-            GuestFramebufferView(source: source) { event in
-                emulatorCore.sendInput(event)
+            ZStack {
+                GuestFramebufferView(source: source) { event in
+                    emulatorCore.sendInput(event)
+                }
+                DigitizerTouchSurface { message in
+                    emulatorCore.log(message)
+                } onTouch: { event in
+                    emulatorCore.sendInput(event)
+                }
             }
+            .contentShape(Rectangle())
         } else {
             BootProgressView(stage: emulatorCore.bootStage, instructionsPerSecond: emulatorCore.instructionsPerSecond, kernelDetail: emulatorCore.jitStatus)
         }

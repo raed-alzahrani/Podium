@@ -11,6 +11,113 @@ import UIKit
 /// and drawn as a full-screen triangle, so the only CPU work per frame is
 /// that one copy. Touches land on this view and are reported as guest
 /// digitizer events.
+/// Clear view laid over the framebuffer. The metal view was not a reliable
+/// hit target (a SwiftUI clip or a zero frame swallowed the touch), so
+/// this view is the one `touchesBegan` has to reach. It logs each phase
+/// and forwards one primary finger.
+struct DigitizerTouchSurface: UIViewRepresentable {
+    var onLog: (String) -> Void
+    var onTouch: (InputEvent) -> Void
+
+    func makeUIView(context: Context) -> DigitizerTouchView {
+        let view = DigitizerTouchView()
+        view.onLog = onLog
+        view.onTouch = onTouch
+        return view
+    }
+
+    func updateUIView(_ view: DigitizerTouchView, context: Context) {
+        view.onLog = onLog
+        view.onTouch = onTouch
+    }
+}
+
+final class DigitizerTouchView: UIView {
+    var onLog: ((String) -> Void)?
+    var onTouch: ((InputEvent) -> Void)?
+    private weak var primaryTouch: UITouch?
+    private var moves = 0
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        isUserInteractionEnabled = true
+        isMultipleTouchEnabled = true
+        backgroundColor = .clear
+        isOpaque = false
+        autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+        bounds.contains(point)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        if bounds.width < 2, let superview, superview.bounds.width > 2 {
+            frame = superview.bounds
+        }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard primaryTouch == nil, let touch = touches.first else { return }
+        primaryTouch = touch
+        moves = 0
+        deliver(.touchBegan(devicePoint(touch)), touch, phase: "touchesBegan")
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let primaryTouch, touches.contains(primaryTouch) else { return }
+        moves += 1
+        let point = devicePoint(primaryTouch)
+        if moves == 1 || moves % 25 == 0 {
+            onLog?("host touchesMoved #\(moves) bounds \(sizeText) local \(localText(primaryTouch)) guest \(Int(point.x)),\(Int(point.y))")
+        }
+        onTouch?(.touchMoved(point))
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        end("touchesEnded", touches)
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        end("touchesCancelled", touches)
+    }
+
+    private func end(_ phase: String, _ touches: Set<UITouch>) {
+        guard let primaryTouch, touches.contains(primaryTouch) else { return }
+        let point = devicePoint(primaryTouch)
+        self.primaryTouch = nil
+        deliver(.touchEnded(point), primaryTouch, phase: phase)
+    }
+
+    private func deliver(_ event: InputEvent, _ touch: UITouch, phase: String) {
+        let point = devicePoint(touch)
+        onLog?("host \(phase) bounds \(sizeText) local \(localText(touch)) guest \(Int(point.x)),\(Int(point.y))")
+        onTouch?(event)
+    }
+
+    /// Fraction of this view, times the guest framebuffer's 640×960 pixels.
+    /// The digitizer then scales that into its 5000×7500 sensor surface.
+    private func devicePoint(_ touch: UITouch) -> TouchPoint {
+        let bounds = self.bounds
+        guard bounds.width > 1, bounds.height > 1 else { return TouchPoint(x: 0, y: 0, touchID: 0) }
+        let location = touch.location(in: self)
+        let x = min(max(location.x / bounds.width, 0), 1) * Double(GuestMemoryLayout.framebufferWidth)
+        let y = min(max(location.y / bounds.height, 0), 1) * Double(GuestMemoryLayout.framebufferHeight)
+        return TouchPoint(x: x, y: y, touchID: 0)
+    }
+
+    private var sizeText: String { "\(Int(bounds.width))×\(Int(bounds.height))" }
+
+    private func localText(_ touch: UITouch) -> String {
+        let location = touch.location(in: self)
+        return "\(Int(location.x)),\(Int(location.y))"
+    }
+}
+
 struct GuestFramebufferView: UIViewRepresentable {
     let source: FramebufferSource
     var onTouch: (InputEvent) -> Void
@@ -84,7 +191,10 @@ final class FramebufferMetalView: UIView {
             return device.makeSamplerState(descriptor: descriptor)
         }
         super.init(frame: .zero)
-        isUserInteractionEnabled = true
+        // The clear DigitizerTouchSurface in front of this view is the hit
+        // target. Leaving this one enabled let it swallow the touch when
+        // its frame and the SwiftUI frame disagreed.
+        isUserInteractionEnabled = false
         isMultipleTouchEnabled = true
         autoresizingMask = [.flexibleWidth, .flexibleHeight]
         layer.cornerRadius = 5

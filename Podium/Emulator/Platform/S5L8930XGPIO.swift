@@ -59,6 +59,24 @@ final class S5L8930XGPIO: MMIODevice {
         }
     }
 
+    /// Whether this pin can interrupt, for the touch-frame log.
+    func touchLineDescription(_ pin: Int) -> String {
+        let mode = registers[pin] & 0xE
+        let armed = enabled[pin / 32] & (1 << UInt32(pin % 32)) != 0
+        let pending = status[pin / 32] & (1 << UInt32(pin % 32)) != 0
+        let level = inputLevels[pin]
+        let modeName: String
+        switch mode {
+        case 0x4: modeName = "level-high"
+        case 0x6: modeName = "level-low"
+        case 0x8: modeName = "rising"
+        case 0xA: modeName = "falling"
+        case 0xC: modeName = "both-edges"
+        default: modeName = String(format: "mode %#x", mode)
+        }
+        return "GPIO \(pin) \(modeName) enabled=\(armed) pending=\(pending) level=\(level.map { $0 ? "high" : "low" } ?? "undriven") vic=\(pendingBlocks != 0)"
+    }
+
     /// Drives an input pin, raising its interrupt if its mode says so.
     func setInputLevel(_ level: Bool, pin: Int) {
         let previous = inputLevels[pin]

@@ -102,6 +102,11 @@ final class MultitouchN1: SPISlave {
     var setAttention: ((Bool) -> Void)?
     /// Diagnostic hook: one line per transaction.
     var traceTransaction: ((String) -> Void)?
+    /// Finger events and whether they raised the attention line.
+    var traceTouch: ((String) -> Void)?
+    /// GPIO line state, filled in by the platform. Read when a frame is announced.
+    var interruptStatus: (() -> String)?
+    private var lastTrace = ""
 
     private static let statusOK: [UInt8] = [0x4B, 0xC1]
     private static let statusRegisterWritten: [UInt8] = [0x4A, 0xD1]
@@ -195,7 +200,11 @@ final class MultitouchN1: SPISlave {
             current.state = 5 // BreakTouch: lifted, still in range
             finger = current
         }
+        if !selected { answerPending = false }
         emitFrame(time: time)
+        if phase != .moved {
+            note("digitizer \(phase) sensor \(Int(sensorX)),\(Int(sensorY)) on \(Self.surfaceWidth)×\(Self.surfaceHeight) (hundredths of a mm, origin bottom-left) firmware=\(mode == .firmware) \(interruptStatus?() ?? "")")
+        }
     }
 
     /// The controller's scan: while a finger is down it reports every
@@ -208,7 +217,10 @@ final class MultitouchN1: SPISlave {
     }
 
     private func emitFrame(time: UInt32) {
-        guard mode == .firmware else { return }
+        guard mode == .firmware else {
+            note("digitizer dropped a frame: controller is in its bootloader, so no packet and no IRQ")
+            return
+        }
         var fingers: [[UInt8]] = []
         if let current = finger {
             if current.state != 0 { fingers.append(Self.fingerRecord(current)) }
@@ -251,11 +263,26 @@ final class MultitouchN1: SPISlave {
     /// Loads the next frame's length and pulls ATN low for it, unless the
     /// host is between asking something and collecting the answer.
     private func announceIfIdle() {
-        guard mode == .firmware, !announcing, !answerPending, let frame = frames.first else { return }
+        guard mode == .firmware, let frame = frames.first else { return }
+        // A finished SPI transaction must not keep the attention line idle.
+        // The driver only comes back to the FIFO when that line falls, so a
+        // stuck "reply not collected" flag would swallow every finger.
+        if !selected { answerPending = false }
+        guard !announcing, !answerPending else {
+            note("frame queued (\(frames.count), \(frame.count) bytes) but ATN not raised: announcing=\(announcing) answerPending=\(answerPending) selected=\(selected)")
+            return
+        }
         let length = frame.count + 2
         reply = Self.packet([0xEA, UInt8(length & 0xFF), UInt8(length >> 8)])
         announcing = true
         setAttention?(true)
+        note("ATN asserted, \(frames.count) frame(s) queued")
+    }
+
+    private func note(_ message: String) {
+        guard message != lastTrace else { return }
+        lastTrace = message
+        traceTouch?(message)
     }
 
     // MARK: Protocol

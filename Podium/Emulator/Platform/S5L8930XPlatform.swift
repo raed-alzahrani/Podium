@@ -129,6 +129,9 @@ final class S5L8930XPlatform: DeviceEventHandler {
         touch.setAttention = { [unowned self] asserted in
             self.gpio.setInputLevel(!asserted, pin: S5L8930XGPIO.Pin.touchInterrupt)
         }
+        touch.interruptStatus = { [unowned self] in
+            self.gpio.touchLineDescription(S5L8930XGPIO.Pin.touchInterrupt)
+        }
         gpio.onOutputChanged = { [unowned self] pin, level in
             // The touch controller's chip select is active low; its reset
             // line puts it back in its bootloader.
