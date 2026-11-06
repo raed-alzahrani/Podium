@@ -33,23 +33,13 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
-      - name: Ad-hoc sign and package the IPA
+      - name: Package the IPA
         run: |
           APP="build/Build/Products/Release-iphoneos/Podium.app"
           test -d "$APP"
           rm -rf Payload
           mkdir Payload
           cp -R "$APP" Payload/
-          # The unsigned build has no signature, so the entitlements never
-          # land in the binary. Ad-hoc sign them in, including the DER form
-          # the kernel reads on iOS 15+.
-          codesign -s - --force --generate-entitlement-der --entitlements Podium.entitlements Payload/Podium.app
-          # macOS 26 prints a [Dict] dump unless --xml is requested, and
-          # plutil cannot read that dump. Either form contains the key.
-          codesign -d --entitlements - --xml Payload/Podium.app > signed-entitlements.txt 2>codesign-display.txt \
-            || codesign -d --entitlements - Payload/Podium.app > signed-entitlements.txt 2>>codesign-display.txt
-          cat codesign-display.txt signed-entitlements.txt
-          grep -q 'get-task-allow' signed-entitlements.txt
           zip -qry Podium.ipa Payload
 
       - uses: actions/upload-artifact@v4
