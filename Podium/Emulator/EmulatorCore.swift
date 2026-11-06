@@ -30,6 +30,10 @@ final class EmulatorCore {
     /// Guest instructions per second over the last few seconds.
     private(set) var instructionsPerSecond: Double = 0
     private(set) var jitAvailable = false
+    /// What JIT allocation is doing, shown under "Loading the kernel…".
+    private(set) var jitStatus = ""
+    /// Set when StikDebug left a breakpoint stopped and allocation gave up.
+    var jitAlert: String?
 
     var cpu: CPU? { session?.cpu }
     var isPoweredOn: Bool { session != nil && !hasStorageFlushFailure }
@@ -121,16 +125,34 @@ final class EmulatorCore {
                 appendLog(String(format: "Root filesystem ready in %.1f s.", Date().timeIntervalSince(started)))
             }
             bootStage = .loadingKernel
+            jitStatus = "Loading the kernel…"
+            jitAlert = nil
             let userImage = try persistentGuestStorage.prepareUserVolume(forFirmwareAt: fileURL)
             if userImage.fromOlderRecipe {
                 appendLog("This iOS install was made by an older Podium; erase it in Settings to pick up the newer system image.")
             }
             let rootFilesystem = userImage.url
+            let statusPoll = Task { @MainActor [weak self] in
+                while !Task.isCancelled {
+                    let text = String(cString: podium_jit_status())
+                    if !text.isEmpty { self?.jitStatus = text }
+                    try? await Task.sleep(nanoseconds: 200_000_000)
+                }
+            }
+            defer { statusPoll.cancel() }
             let session = try await Task.detached(priority: .userInitiated) {
                 let kernel = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
                 let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
                 return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true)
             }.value
+            let jitReport = String(cString: podium_jit_status())
+            if !jitReport.isEmpty {
+                jitStatus = jitReport
+                appendLog(jitReport)
+            }
+            if podium_jit_breakpoint_abandoned() {
+                jitAlert = jitReport
+            }
             session.onFinish = { [weak self, weak session] state in
                 Task { @MainActor in
                     guard let self, let session, self.session === session else { return }

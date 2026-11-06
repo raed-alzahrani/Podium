@@ -20,6 +20,12 @@ typedef enum {
 /// hand out memory that can be both written and run.
 bool podium_jit_debugger_attached(void);
 
+/// The latest allocation step, for the boot screen and the emulator log.
+const char *podium_jit_status(void);
+
+/// True when a `brk #0xf00d` was not resumed and allocation gave up.
+bool podium_jit_breakpoint_abandoned(void);
+
 /// Allocates `size` bytes for translated code, once per process: never
 /// call it again after it succeeds (every extra request is another round
 /// trip to the debugger). Returns where the code runs from and stores

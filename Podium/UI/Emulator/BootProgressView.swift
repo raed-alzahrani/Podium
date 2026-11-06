@@ -6,6 +6,7 @@ import SwiftUI
 struct BootProgressView: View {
     let stage: EmulatorCore.BootStage?
     let instructionsPerSecond: Double
+    var kernelDetail: String = ""
 
     var body: some View {
         ZStack {
@@ -45,7 +46,7 @@ struct BootProgressView: View {
         case .preparingFilesystem(let phase, let fraction):
             // Extraction is the quicker half of the work.
             return phase == .extracting ? fraction * 0.4 : 0.4 + fraction * 0.6
-        case .loadingKernel: return 0
+        case .loadingKernel: return 0.05
         case .booting(let fraction, _): return fraction
         case .running: return 1
         }
@@ -70,7 +71,9 @@ struct BootProgressView: View {
         case .booting:
             guard instructionsPerSecond > 0 else { return nil }
             return String(format: "%.0f M instructions/s", instructionsPerSecond / 1_000_000)
-        default:
+        case .loadingKernel:
+            return kernelDetail.isEmpty ? nil : kernelDetail
+        case .running:
             return nil
         }
     }

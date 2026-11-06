@@ -16,7 +16,7 @@ struct EmulatorScreen: View {
         if emulatorCore.bootStage == .running, let source = emulatorCore.framebufferSource {
             GuestFramebufferView(source: source)
         } else {
-            BootProgressView(stage: emulatorCore.bootStage, instructionsPerSecond: emulatorCore.instructionsPerSecond)
+            BootProgressView(stage: emulatorCore.bootStage, instructionsPerSecond: emulatorCore.instructionsPerSecond, kernelDetail: emulatorCore.jitStatus)
         }
     }
 
@@ -65,6 +65,14 @@ struct EmulatorScreen: View {
             .ignoresSafeArea(edges: .bottom)
         }
         .navigationBarTitleDisplayMode(.inline)
+        .alert("JIT", isPresented: Binding(
+            get: { emulatorCore.jitAlert != nil },
+            set: { if !$0 { emulatorCore.jitAlert = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(emulatorCore.jitAlert ?? "")
+        }
         .toolbar(.hidden, for: .tabBar)
         .toolbar {
             ToolbarItem(placement: .principal) {
