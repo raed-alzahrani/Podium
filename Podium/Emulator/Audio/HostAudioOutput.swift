@@ -12,6 +12,9 @@ import Foundation
 /// the thread that just finished a DMA store; waiting there on the
 /// render callback's lock (or on `AVAudioEngine`) stalls every guest
 /// thread behind it, including SpringBoard during the unlock animation.
+/// Session activation stays on the main thread: an engine started before
+/// `AVAudioSession` is active plays silence, and iOS will not route
+/// buffers from a session that was never made active.
 final class HostAudioOutput: AudioOutput {
     var volume: Float = 1 {
         didSet { engine.mainMixerNode.outputVolume = volume }
@@ -20,12 +23,19 @@ final class HostAudioOutput: AudioOutput {
     private let engine = AVAudioEngine()
     private let format: AVAudioFormat
     private let lock = NSLock()
+    private let scheduleLock = NSLock()
     private let enqueueQueue = DispatchQueue(label: "podium.audio.enqueue", qos: .userInteractive)
     private var ring: [Float]
     private var readIndex = 0
     private var available = 0
     private var lockSound: [Float]
     private var preparedRoot: URL?
+    /// Set once category + setActive have succeeded. Until then a running
+    /// engine is restarted, because the first start often happens before
+    /// the app is allowed to play.
+    private var needsSessionRestart = true
+    private var playbackLive = false
+    private var playbackScheduled = false
 
     init() {
         format = AVAudioFormat(standardFormatWithSampleRate: Double(S5L8930XI2S.sampleRate), channels: 2)!
@@ -37,7 +47,8 @@ final class HostAudioOutput: AudioOutput {
         }
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
-        startEngine()
+        engine.isAutoShutdownEnabled = false
+        requestPlayback()
     }
 
     private var audible = false
@@ -48,24 +59,37 @@ final class HostAudioOutput: AudioOutput {
         guard !samples.isEmpty else { return }
         // The emulation thread must not take `lock` or call into
         // AVAudioSession. Both can wait on the render callback, and a
-        // wait there freezes the guest on the Apple logo.
+        // wait there freezes the guest on the Apple logo. The samples
+        // go into the ring first; the main thread brings the session up.
         audible = true
         let copy = samples
         enqueueQueue.async { [weak self] in
             guard let self else { return }
-            self.startEngine()
             self.lock.lock()
             self.append(copy)
             self.lock.unlock()
         }
+        requestPlayback()
     }
 
     func pause() {
-        engine.pause()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.engine.pause()
+            self.scheduleLock.lock()
+            self.playbackLive = false
+            self.scheduleLock.unlock()
+        }
     }
 
     func resume() {
-        startEngine()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.scheduleLock.lock()
+            self.playbackLive = false
+            self.scheduleLock.unlock()
+            self.startEngine()
+        }
     }
 
     func prepareLockSound(rootFilesystem: URL) {
@@ -87,18 +111,74 @@ final class HostAudioOutput: AudioOutput {
         let samples = lockSound
         lock.unlock()
         guard !samples.isEmpty else { return }
-        startEngine()
-        lock.lock()
-        append(samples)
-        lock.unlock()
+        let copy = samples
+        enqueueQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.append(copy)
+            self.lock.unlock()
+        }
+        requestPlayback()
+    }
+
+    /// Hops to the main thread without waiting. `AVAudioSession` and
+    /// `AVAudioEngine` both have to be touched there; doing it on the
+    /// enqueue queue deadlocks the mixer behind the guest. One request
+    /// is enough until that hop runs — a playing guest enqueues hundreds
+    /// of times a second.
+    private func requestPlayback() {
+        scheduleLock.lock()
+        if playbackLive || playbackScheduled {
+            scheduleLock.unlock()
+            return
+        }
+        playbackScheduled = true
+        scheduleLock.unlock()
+        let fire = { [weak self] in
+            guard let self else { return }
+            self.startEngine()
+            self.scheduleLock.lock()
+            self.playbackScheduled = false
+            self.scheduleLock.unlock()
+        }
+        if Thread.isMainThread {
+            fire()
+        } else {
+            DispatchQueue.main.async(execute: fire)
+        }
     }
 
     private func startEngine() {
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .default)
-        try? session.setActive(true)
-        guard !engine.isRunning else { return }
-        try? engine.start()
+        if needsSessionRestart, engine.isRunning {
+            engine.stop()
+        }
+        if needsSessionRestart {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+                try? session.setPreferredSampleRate(Double(S5L8930XI2S.sampleRate))
+                try session.setActive(true)
+                needsSessionRestart = false
+            } catch {
+                needsSessionRestart = true
+            }
+        }
+        engine.mainMixerNode.outputVolume = volume
+        let running: Bool
+        if engine.isRunning {
+            running = true
+        } else {
+            engine.prepare()
+            do {
+                try engine.start()
+                running = engine.isRunning
+            } catch {
+                running = false
+            }
+        }
+        scheduleLock.lock()
+        playbackLive = running && !needsSessionRestart
+        scheduleLock.unlock()
     }
 
     private func append(_ samples: [Float]) {
@@ -118,33 +198,55 @@ final class HostAudioOutput: AudioOutput {
 
     private func render(frameCount: AVAudioFrameCount, list: UnsafeMutablePointer<AudioBufferList>) {
         let buffers = UnsafeMutableAudioBufferListPointer(list)
-        guard let left = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
-        let right = buffers.count > 1 ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
+        guard !buffers.isEmpty, let left = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
+        let count = Int(frameCount)
+        let channels = max(1, Int(buffers[0].mNumberChannels))
+        let split = buffers.count > 1
+        let right = split ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
         // Never block the device callback. If the enqueue queue holds the
         // ring, this quantum plays silence and the next one catches up;
         // blocking here backs up into the emulation thread's enqueue.
         guard lock.`try`() else {
-            for frame in 0..<Int(frameCount) {
-                left[frame] = 0
-                right?[frame] = 0
-            }
+            writeSilence(left: left, right: right, split: split, channels: channels, from: 0, to: count)
             return
         }
-        let frames = min(Int(frameCount), available / 2)
+        let frames = min(count, available / 2)
         for frame in 0..<frames {
-            left[frame] = ring[readIndex]
+            let leftSample = ring[readIndex]
             readIndex = (readIndex + 1) % ring.count
-            let sample = ring[readIndex]
+            let rightSample = ring[readIndex]
             readIndex = (readIndex + 1) % ring.count
-            right?[frame] = sample
             available -= 2
+            write(leftSample: leftSample, rightSample: rightSample, frame: frame, left: left, right: right, split: split, channels: channels)
         }
         lock.unlock()
-        if frames < Int(frameCount) {
-            for frame in frames..<Int(frameCount) {
+        if frames < count {
+            writeSilence(left: left, right: right, split: split, channels: channels, from: frames, to: count)
+        }
+    }
+
+    private func write(leftSample: Float, rightSample: Float, frame: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>?, split: Bool, channels: Int) {
+        if split {
+            left[frame] = leftSample
+            right?[frame] = rightSample
+        } else if channels == 1 {
+            left[frame] = (leftSample + rightSample) * 0.5
+        } else {
+            left[frame * channels] = leftSample
+            left[frame * channels + 1] = rightSample
+        }
+    }
+
+    private func writeSilence(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>?, split: Bool, channels: Int, from: Int, to: Int) {
+        if split {
+            for frame in from..<to {
                 left[frame] = 0
                 right?[frame] = 0
             }
+        } else {
+            let begin = from * channels
+            let end = to * channels
+            for index in begin..<end { left[index] = 0 }
         }
     }
 

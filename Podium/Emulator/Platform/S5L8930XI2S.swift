@@ -20,9 +20,9 @@ import Foundation
 /// one or two frames of audio). Completing `unlock.caf` inside the store
 /// that started it raises the done interrupt before the audio work loop
 /// can sleep; that loop then resubmits forever and the main thread —
-/// SpringBoard's unlock animation — never runs. Bytes that arrive for a
-/// register the endpoint table doesn't name are staged and released on
-/// the same clock.
+/// SpringBoard's unlock animation — never runs. Bytes the endpoint table
+/// does not name are converted and handed to the host mixer as the DMA
+/// engine reads them.
 final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     static let windowLength: UInt32 = 0xC00
     static let controlChannelIdle: UInt32 = 1 << 1
@@ -35,6 +35,7 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     var output: AudioOutput?
     private var registers = [UInt32](repeating: 0, count: Int(windowLength / 4))
     private var pending: [UInt8] = []
+    private var pendingRead = 0
     private var frames: [Float] = []
     /// How many DMA bytes the sample clock has released and the channel
     /// has not taken yet.
@@ -53,14 +54,14 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     var dmaAvailable: Int { 0 }
     func dmaPop() -> UInt8 { 0 }
 
-    /// A whole DMA buffer, played whether or not control bit 0 is set.
-    /// Programmed writes of the transmit register still wait for that bit.
-    /// The bytes wait for the sample clock instead of entering the host
-    /// mixer inside the guest's start-DMA store.
+    /// Hands guest PCM to the host mixer immediately. The bytes are already
+    /// the ones the DMA engine took out of guest memory; leaving them
+    /// staged for a later clock tick dropped lock.caf and unlock.caf on
+    /// the floor whenever that tick had already run.
     func ingest(_ bytes: [UInt8]) {
         guard !bytes.isEmpty else { return }
-        compactStagedIfNeeded()
-        staged.append(contentsOf: bytes)
+        for byte in bytes { accept(byte) }
+        flush()
     }
 
     /// Releases one guest frame of transmit audio. Called from the frame
@@ -106,6 +107,7 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
         registers[Int(offset / 4)] = value
         if offset == 0, wasTransmitting, !transmitting {
             pending.removeAll()
+            pendingRead = 0
             frames.removeAll()
             return
         }
@@ -122,13 +124,19 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
 
     private func accept(_ byte: UInt8) {
         pending.append(byte)
-        guard pending.count >= 4 else { return }
-        let left = Int16(bitPattern: UInt16(pending[0]) | UInt16(pending[1]) << 8)
-        let right = Int16(bitPattern: UInt16(pending[2]) | UInt16(pending[3]) << 8)
-        pending.removeFirst(4)
-        frames.append(Float(left) / 32768)
-        frames.append(Float(right) / 32768)
-        if frames.count >= 512 { deliver() }
+        while pending.count - pendingRead >= 4 {
+            let index = pendingRead
+            let left = Int16(bitPattern: UInt16(pending[index]) | UInt16(pending[index + 1]) << 8)
+            let right = Int16(bitPattern: UInt16(pending[index + 2]) | UInt16(pending[index + 3]) << 8)
+            pendingRead += 4
+            frames.append(Float(left) / 32768)
+            frames.append(Float(right) / 32768)
+            if frames.count >= 512 { deliver() }
+        }
+        if pendingRead > 4096 {
+            pending.removeFirst(pendingRead)
+            pendingRead = 0
+        }
     }
 
     /// Sends whatever has accumulated. The platform calls this once a
