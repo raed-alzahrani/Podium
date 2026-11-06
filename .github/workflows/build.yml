@@ -33,17 +33,22 @@ jobs:
             CODE_SIGNING_REQUIRED=NO \
             build
 
-      - name: Package the unsigned IPA
+      - name: Ad-hoc sign and package the IPA
         run: |
           APP="build/Build/Products/Release-iphoneos/Podium.app"
           test -d "$APP"
           rm -rf Payload
           mkdir Payload
           cp -R "$APP" Payload/
-          zip -qry Podium-unsigned.ipa Payload
+          # The unsigned build has no signature, so the entitlements never
+          # land in the binary. Ad-hoc sign them in, including the DER form
+          # the kernel reads on iOS 15+.
+          codesign -s - --force --generate-entitlement-der --entitlements Podium.entitlements Payload/Podium.app
+          codesign -d --entitlements :- Payload/Podium.app | grep -q get-task-allow
+          zip -qry Podium.ipa Payload
 
       - uses: actions/upload-artifact@v4
         with:
-          name: Podium-unsigned-ipa
-          path: Podium-unsigned.ipa
+          name: Podium-ipa
+          path: Podium.ipa
           if-no-files-found: error

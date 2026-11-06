@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Secondary, hidden-by-default screen (Section 13 of the project spec).
 /// Everything here is either a real static fact, the CPU's actual live
@@ -8,6 +9,7 @@ import SwiftUI
 /// else in the app depends only on the `CPU` protocol.
 struct DeveloperSettingsScreen: View {
     @Environment(EmulatorCore.self) private var emulatorCore
+    @State private var stikDebugUnavailable = false
 
     private var armCPU: ARMv7CPU? {
         emulatorCore.cpu as? ARMv7CPU
@@ -40,6 +42,9 @@ struct DeveloperSettingsScreen: View {
             }
 
             Section {
+                Button("Turn on JIT") {
+                    openStikDebug()
+                }
                 if let jit = armCPU?.jit {
                     LabeledContent("Available", value: jit.isAvailable ? "Yes" : "No — interpreting only")
                     LabeledContent("Compiled Blocks", value: "\(jit.stats.compiledBlockCount)")
@@ -81,9 +86,32 @@ struct DeveloperSettingsScreen: View {
                     }
                 }
             }
+
+            Section {
+                Text("Development Version - JIT Enabled Build")
+                    .fontWeight(.bold)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .center)
+            }
         }
         .navigationTitle("Developer")
         .navigationBarTitleDisplayMode(.inline)
+        .alert("StikDebug isn't available", isPresented: $stikDebugUnavailable) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text("Install StikDebug, then try Turn on JIT again.")
+        }
+    }
+
+    private func openStikDebug() {
+        guard let url = URL(string: "stikdebug://") else { return }
+        UIApplication.shared.open(url) { accepted in
+            if !accepted {
+                Task { @MainActor in
+                    stikDebugUnavailable = true
+                }
+            }
+        }
     }
 
     private func hex(_ value: UInt32) -> String {
