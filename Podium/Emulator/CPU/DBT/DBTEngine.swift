@@ -694,7 +694,7 @@ final class DBTEngine {
         let code = UnsafeRawPointer(region.executable + cursor)
         let length = words.count * 4
         let guestBytes = emitter.coveredBytes
-        let guest = page + Int(physical & 0xFFF)
+        let guest = page.advanced(by: Int(physical & 0xFFF))
         cursor = (cursor + length + 15) & ~15
         statistics.blocksTranslated += 1
         statistics.guestInstructionsTranslated += translated
@@ -771,42 +771,46 @@ final class DBTEngine {
     func checkpointJITCache() {
         guard cacheDirty, !Self.recordBlocks, cursor > runtimeEnd, !blockCoverage.isEmpty else { return }
         var data = Data()
-        func put<T: FixedWidthInteger>(_ value: T) {
+        func put32(_ value: UInt32) {
             var little = value.littleEndian
-            withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+            withUnsafeBytes(of: &little) { data.append(contentsOf: Array($0)) }
+        }
+        func put64(_ value: UInt64) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { data.append(contentsOf: Array($0)) }
         }
         var links: [(UInt32, UInt64)] = []
         links.reserveCapacity(linksInto.count)
         for (key, slots) in linksInto {
             for slot in slots { links.append((UInt32(slot), key)) }
         }
-        put(Self.cacheMagic)
-        put(Self.cacheVersion)
-        put(UInt32(runtimeEnd))
-        put(UInt32(cursor))
-        put(UInt32(blockCoverage.count))
-        put(UInt32(links.count))
-        put(UInt32(slotOwners.count))
-        put(UInt32(0))
+        put32(Self.cacheMagic)
+        put32(Self.cacheVersion)
+        put32(UInt32(runtimeEnd))
+        put32(UInt32(cursor))
+        put32(UInt32(blockCoverage.count))
+        put32(UInt32(links.count))
+        put32(UInt32(slotOwners.count))
+        put32(0)
         for (key, coverage) in blockCoverage {
-            put(key)
-            put(UInt32(coverage.offset))
-            put(UInt32(coverage.length))
-            put(coverage.physical)
-            put(UInt32(max(coverage.guestBytes, 0)))
-            put(coverage.hash)
-            put(coverage.virtualPage)
-            put(UInt32(0))
+            put64(key)
+            put32(UInt32(truncatingIfNeeded: coverage.offset))
+            put32(UInt32(truncatingIfNeeded: coverage.length))
+            put32(coverage.physical)
+            put32(UInt32(truncatingIfNeeded: max(coverage.guestBytes, 0)))
+            put64(coverage.hash)
+            put32(coverage.virtualPage)
+            put32(0)
         }
         for (slot, key) in links {
-            put(slot)
-            put(UInt32(0))
-            put(key)
+            put32(slot)
+            put32(0)
+            put64(key)
         }
         for (slot, key) in slotOwners {
-            put(UInt32(slot))
-            put(UInt32(0))
-            put(key)
+            put32(UInt32(truncatingIfNeeded: slot))
+            put32(0)
+            put64(key)
         }
         let imageCount = cursor - runtimeEnd
         guard imageCount > 0, runtimeEnd + imageCount <= region.size else { return }
@@ -816,7 +820,8 @@ final class DBTEngine {
         do {
             try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try data.write(to: url, options: .atomic)
-            PodiumLog.emulator.notice("jit cache saved \(blockCoverage.count, privacy: .public) blocks")
+            let message = "jit cache saved \(blockCoverage.count) blocks"
+            PodiumLog.emulator.notice("\(message, privacy: .public)")
         } catch {
             cacheDirty = true
             PodiumLog.emulator.error("jit cache write failed: \(error.localizedDescription, privacy: .public)")
@@ -828,22 +833,27 @@ final class DBTEngine {
         let url = Self.cacheURL
         guard let data = try? Data(contentsOf: url), data.count > 32 else { return }
         var offset = 0
-        func take<T: FixedWidthInteger>(_ type: T.Type) -> T? {
-            let size = MemoryLayout<T>.size
-            guard offset + size <= data.count else { return nil }
-            let value = data.subdata(in: offset..<(offset + size)).withUnsafeBytes { raw -> T in
-                var loaded = T.zero
-                withUnsafeMutableBytes(of: &loaded) { $0.copyBytes(from: raw) }
-                return T(littleEndian: loaded)
+        func take32() -> UInt32? {
+            guard offset + 4 <= data.count else { return nil }
+            let value = data.subdata(in: offset..<(offset + 4)).withUnsafeBytes { raw in
+                raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
             }
-            offset += size
+            offset += 4
             return value
         }
-        guard let magic = take(UInt32.self), magic == Self.cacheMagic,
-              let version = take(UInt32.self), version == Self.cacheVersion else { return }
-        guard let storedRuntime = take(UInt32.self), let imageEnd = take(UInt32.self),
-              let blockCount = take(UInt32.self), let linkCount = take(UInt32.self),
-              let slotCount = take(UInt32.self), take(UInt32.self) != nil else { return }
+        func take64() -> UInt64? {
+            guard offset + 8 <= data.count else { return nil }
+            let value = data.subdata(in: offset..<(offset + 8)).withUnsafeBytes { raw in
+                raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
+            }
+            offset += 8
+            return value
+        }
+        guard let magic = take32(), magic == Self.cacheMagic,
+              let version = take32(), version == Self.cacheVersion else { return }
+        guard let storedRuntime = take32(), let imageEnd = take32(),
+              let blockCount = take32(), let linkCount = take32(),
+              let slotCount = take32(), take32() != nil else { return }
         guard storedRuntime == UInt32(runtimeEnd), imageEnd >= storedRuntime,
               Int(imageEnd) <= region.size, blockCount < 2_000_000, linkCount < 4_000_000, slotCount < 4_000_000 else { return }
         struct Record {
@@ -857,23 +867,23 @@ final class DBTEngine {
         }
         var records: [Record] = []
         records.reserveCapacity(Int(blockCount))
-        for _ in 0..<blockCount {
-            guard let key = take(UInt64.self), let codeOffset = take(UInt32.self), let length = take(UInt32.self),
-                  let physical = take(UInt32.self), let guestBytes = take(UInt32.self), let hash = take(UInt64.self),
-                  let virtualPage = take(UInt32.self), take(UInt32.self) != nil else { return }
+        for _ in 0..<Int(blockCount) {
+            guard let key = take64(), let codeOffset = take32(), let length = take32(),
+                  let physical = take32(), let guestBytes = take32(), let hash = take64(),
+                  let virtualPage = take32(), take32() != nil else { return }
             let start = Int(codeOffset), bytes = Int(length)
             guard start >= runtimeEnd, bytes > 0, start + bytes <= Int(imageEnd) else { return }
             records.append(Record(key: key, codeOffset: start, length: bytes, physical: physical,
                                   guestBytes: Int(guestBytes), hash: hash, virtualPage: virtualPage))
         }
         var links: [(Int, UInt64)] = []
-        for _ in 0..<linkCount {
-            guard let slot = take(UInt32.self), take(UInt32.self) != nil, let key = take(UInt64.self) else { return }
+        for _ in 0..<Int(linkCount) {
+            guard let slot = take32(), take32() != nil, let key = take64() else { return }
             links.append((Int(slot), key))
         }
         var slots: [(Int, UInt64)] = []
-        for _ in 0..<slotCount {
-            guard let slot = take(UInt32.self), take(UInt32.self) != nil, let key = take(UInt64.self) else { return }
+        for _ in 0..<Int(slotCount) {
+            guard let slot = take32(), take32() != nil, let key = take64() else { return }
             slots.append((Int(slot), key))
         }
         let imageCount = Int(imageEnd) - runtimeEnd
@@ -901,7 +911,8 @@ final class DBTEngine {
         statistics.blocksTranslated += records.count
         restoredBlocks = records.count
         cacheDirty = false
-        PodiumLog.emulator.notice("jit cache loaded \(records.count, privacy: .public) blocks")
+        let message = "jit cache loaded \(records.count) blocks"
+        PodiumLog.emulator.notice("\(message, privacy: .public)")
     }
 
     // MARK: Invalidation
@@ -922,24 +933,26 @@ final class DBTEngine {
         let index = Int((page &- ramBase) >> 12)
         guard index >= 0, index < ramPages, var keys = keysByPage[page] else { return }
         let writeEnd = address &+ UInt32(width)
+        var kept: [UInt64] = []
+        kept.reserveCapacity(keys.count)
         var dropped = false
-        keys.removeAll { key in
-            guard let coverage = blockCoverage[key] else { return false }
-            let blockEnd = coverage.physical &+ UInt32(coverage.guestBytes)
-            guard coverage.guestBytes > 0 else {
+        for key in keys {
+            guard let coverage = blockCoverage[key], coverage.guestBytes > 0 else {
                 discard(key)
                 dropped = true
-                return true
+                continue
             }
-            guard address < blockEnd, writeEnd > coverage.physical else { return false }
-            let guest = ramHost(coverage.physical & 0xFFFF_F000).map { UnsafeRawPointer($0) + Int(coverage.physical & 0xFFF) }
-            if let hash = Self.hashGuest(guest, bytes: coverage.guestBytes), hash == coverage.hash {
-                return false
+            let blockEnd = coverage.physical &+ UInt32(coverage.guestBytes)
+            let overlaps = address < blockEnd && writeEnd > coverage.physical
+            let guest = ramHost(coverage.physical & 0xFFFF_F000).map { UnsafeRawPointer($0).advanced(by: Int(coverage.physical & 0xFFF)) }
+            if !overlaps || Self.hashGuest(guest, bytes: coverage.guestBytes) == coverage.hash {
+                kept.append(key)
+            } else {
+                discard(key)
+                dropped = true
             }
-            discard(key)
-            dropped = true
-            return true
         }
+        keys = kept
         guard dropped || keys.isEmpty else { return }
         if keys.isEmpty {
             keysByPage[page] = nil

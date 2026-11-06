@@ -264,7 +264,6 @@ final class FramebufferMetalView: UIView {
         if window != nil {
             guard displayLink == nil else { return }
             let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick))
-            link.preferredFramesPerSecond = 60
             link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
             link.add(to: .main, forMode: .common)
             displayLink = link
