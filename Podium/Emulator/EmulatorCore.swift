@@ -190,6 +190,9 @@ final class EmulatorCore {
             jitAvailable = initial.jitAvailable
             cpuSample = initial.cpuSample
             appendLog("Kernel loaded; iOS is starting.")
+            if session.restoredJITBlocks > 0 {
+                appendLog("JIT cache restored \(session.restoredJITBlocks) blocks from jit_cache.bin.")
+            }
             startPolling()
         } catch let error as FriendlyError {
             fail(error.userMessage, detail: error.developerDetail)
@@ -268,6 +271,7 @@ final class EmulatorCore {
             status = .running
             UserDefaults.standard.set(Double(snapshot.retiredInstructions), forKey: Self.measuredBootInstructionsKey)
             appendLog("Lock screen up after \(snapshot.retiredInstructions) instructions.")
+            session.requestJITCacheSave()
             return
         }
         let expected = expectedBootInstructions

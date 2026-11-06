@@ -44,6 +44,7 @@ enum ThumbTranslator {
                     cursor = cursor &+ UInt32(member.size)
                     if outcome == .ended { ended = true }
                 }
+                e.coveredBytes = Int(cursor &- virtual)
                 if ended { return e.count }
                 address = cursor
                 continue
@@ -56,6 +57,7 @@ enum ThumbTranslator {
                 e.interpret(pc: address, next: address &+ UInt32(size))
                 outcome = .continued
             }
+            e.coveredBytes = Int((address &+ UInt32(size)) &- virtual)
             e.count += 1
             if outcome == .ended { return e.count }
             address = address &+ UInt32(size)

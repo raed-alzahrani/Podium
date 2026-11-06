@@ -1139,9 +1139,17 @@ final class ARMv7CPU: CPU {
     }
 
     @inline(__always)
-    private func noteRAMWrite(_ physical: UInt32) {
-        guard codePageBitmap != nil, isCodePage(physical) else { return }
-        codeWriteObserver?.codeWasWritten(physicalPage: physical & 0xFFFF_F000)
+    private func noteRAMWrite(_ physical: UInt32, width: Int) {
+        guard codePageBitmap != nil, width > 0 else { return }
+        let page = physical & 0xFFFF_F000
+        if isCodePage(page) {
+            codeWriteObserver?.codeWasWritten(physicalPage: page, at: physical, width: width)
+        }
+        let last = physical &+ UInt32(width) &- 1
+        let endPage = last & 0xFFFF_F000
+        if endPage != page, isCodePage(endPage) {
+            codeWriteObserver?.codeWasWritten(physicalPage: endPage, at: endPage, width: Int(last &- endPage) + 1)
+        }
     }
 
     /// The host address of a page of guest RAM (nil if it isn't RAM).
@@ -1172,17 +1180,17 @@ final class ARMv7CPU: CPU {
     }
 
     func writePhysical32(_ value: UInt32, _ physical: UInt32) throws {
-        if let p = ramPointer(physical, width: 4) { p.storeBytes(of: value.littleEndian, as: UInt32.self); noteRAMWrite(physical); return }
+        if let p = ramPointer(physical, width: 4) { p.storeBytes(of: value.littleEndian, as: UInt32.self); noteRAMWrite(physical, width: 4); return }
         try memory.writeWord32(value, at: physical)
     }
 
     func writePhysical16(_ value: UInt16, _ physical: UInt32) throws {
-        if let p = ramPointer(physical, width: 2) { p.storeBytes(of: value.littleEndian, as: UInt16.self); noteRAMWrite(physical); return }
+        if let p = ramPointer(physical, width: 2) { p.storeBytes(of: value.littleEndian, as: UInt16.self); noteRAMWrite(physical, width: 2); return }
         try memory.writeWord16(value, at: physical)
     }
 
     func writePhysical8(_ value: UInt8, _ physical: UInt32) throws {
-        if let p = ramPointer(physical, width: 1) { p.storeBytes(of: value, as: UInt8.self); noteRAMWrite(physical); return }
+        if let p = ramPointer(physical, width: 1) { p.storeBytes(of: value, as: UInt8.self); noteRAMWrite(physical, width: 1); return }
         try memory.writeByte(value, at: physical)
     }
 

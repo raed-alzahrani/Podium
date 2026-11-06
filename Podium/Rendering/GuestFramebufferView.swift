@@ -264,7 +264,8 @@ final class FramebufferMetalView: UIView {
         if window != nil {
             guard displayLink == nil else { return }
             let link = CADisplayLink(target: DisplayLinkTarget(self), selector: #selector(DisplayLinkTarget.tick))
-            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.preferredFramesPerSecond = 60
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 60, maximum: 60, preferred: 60)
             link.add(to: .main, forMode: .common)
             displayLink = link
         } else {
@@ -306,8 +307,9 @@ final class FramebufferMetalView: UIView {
 
     fileprivate func drawFrame() {
         guard let queue, let pipeline, let sampler, metalLayer.drawableSize.width > 0 else { return }
-        // Skip a refresh rather than wait if the GPU is still behind.
-        guard inFlight.wait(timeout: .now()) == .success else { return }
+        // One guest frame per vsync. Waiting out a late GPU completion
+        // keeps the swipe on the display clock instead of skipping a tick.
+        guard inFlight.wait(timeout: .now() + .milliseconds(12)) == .success else { return }
         guard let frame = frameStorage(), let drawable = metalLayer.nextDrawable(),
               let commandBuffer = queue.makeCommandBuffer() else {
             inFlight.signal()

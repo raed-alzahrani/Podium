@@ -29,6 +29,9 @@ struct BlockEmitter {
     /// Guest instructions emitted so far: while emitting instruction `i`,
     /// `count == i`.
     var count = 0
+    /// Guest bytes this block covers, from its first instruction. A store
+    /// outside this span must not throw the block away.
+    var coveredBytes = 0
     /// What a plain read of r15 gives in the instruction being emitted —
     /// the interpreter's `registers[15]`, which by then holds the next
     /// instruction's address. Reads that see `Align(pc + 4)` or `pc + 8`

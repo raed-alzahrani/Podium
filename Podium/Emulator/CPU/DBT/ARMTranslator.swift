@@ -28,6 +28,7 @@ enum ARMTranslator {
                 e.interpret(pc: address, next: address &+ 4)
                 outcome = .continued
             }
+            e.coveredBytes = Int((address &+ 4) &- virtual)
             e.count += 1
             if outcome == .ended { return e.count }
             address = address &+ 4

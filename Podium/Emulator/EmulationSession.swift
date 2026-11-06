@@ -100,6 +100,9 @@ final class EmulationSession {
     /// yet, and the guest time it lands at (emulation thread only).
     private var releasesDue: [Button: UInt64] = [:]
     private var stopRequested = false
+    /// The UI asks for this once the lock screen is up. The emulation
+    /// thread writes `jit_cache.bin` between slices.
+    private var jitCacheSaveRequested = false
     private var state: State = .running
     private var runLoopHasStarted = false
     private var runLoopHasFinished = false
@@ -160,6 +163,16 @@ final class EmulationSession {
         // watchdog, and spins until it lands) ends the run too; the run
         // loop sees it at the end of the chunk.
         platform.watchdog.onReset = { [unowned self] in guestReset = true }
+    }
+
+    /// Blocks restored from `jit_cache.bin` before this boot translated anything.
+    var restoredJITBlocks: Int { cpu.dbt?.restoredBlocks ?? 0 }
+
+    /// Asks the emulation thread to write the translated blocks to disk.
+    func requestJITCacheSave() {
+        lock.lock()
+        jitCacheSaveRequested = true
+        lock.unlock()
     }
 
     func start() {
@@ -389,9 +402,12 @@ final class EmulationSession {
         while true {
             lock.lock()
             let stopping = stopRequested
+            let saveCache = jitCacheSaveRequested
+            jitCacheSaveRequested = false
             let input = pendingInput
             pendingInput.removeAll()
             lock.unlock()
+            if saveCache { cpu.dbt?.checkpointJITCache() }
             if stopping { break }
             apply(input)
 
@@ -435,6 +451,7 @@ final class EmulationSession {
             cpuSample = captureCPUSample()
             lock.unlock()
         }
+        cpu.dbt?.checkpointJITCache()
         let stateBeforeFlush = finalState
         retired = cpu.retiredInstructionCount
         virtualTime = cpu.virtualTime

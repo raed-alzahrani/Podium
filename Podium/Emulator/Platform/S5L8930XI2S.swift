@@ -116,9 +116,12 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
         let wasTransmitting = transmitting
         registers[Int(offset / 4)] = value
         if offset == 0, wasTransmitting, !transmitting {
+            // The lock click is still in this FIFO when the channel stops.
+            // Hand it to the host before dropping the register shadow, and
+            // leave the host ring alone so that tail can finish playing.
+            flush()
             pending.removeAll()
             pendingRead = 0
-            frames.removeAll()
             return
         }
         guard offset == Self.transmitData, transmitting else { return }

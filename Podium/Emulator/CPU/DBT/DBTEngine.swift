@@ -32,8 +32,9 @@ import Foundation
 ///
 /// **Invalidation.** Pages that code was translated from are marked in a
 /// bitmap the CPU checks on stores (translated stores to them deopt,
-/// since the TLB withholds their host address for writes); a store to one
-/// discards everything translated from it.
+/// since the TLB withholds their host address for writes). A store
+/// discards a block only when it changes bytes that block was translated
+/// from. The whole region is flushed only when it fills up.
 final class DBTEngine {
     /// Unretained, and without the checks `unowned` makes on every use —
     /// translated code calls back into the engine for every instruction
@@ -116,6 +117,22 @@ final class DBTEngine {
     private let codePageBitmap: UnsafeMutablePointer<UInt64>
     private let ramBase: UInt32
     private let ramPages: Int
+    /// Guest bytes each block was translated from, so a store elsewhere
+    /// on the same page can leave it in place.
+    private var blockCoverage: [UInt64: Coverage] = [:]
+    /// Set when the in-memory translations differ from `jit_cache.bin`.
+    private var cacheDirty = false
+    /// Blocks installed from disk at launch, before any new translation.
+    private(set) var restoredBlocks = 0
+
+    private struct Coverage {
+        var offset: Int
+        var length: Int
+        var physical: UInt32
+        var guestBytes: Int
+        var hash: UInt64
+        var virtualPage: UInt32
+    }
 
     struct Statistics {
         var blocksTranslated = 0
@@ -166,6 +183,7 @@ final class DBTEngine {
         cpu.codePageBitmap = codePageBitmap
         cpu.codeWriteObserver = self
         cpu.hostFPCR = (readFPCR, writeFPCR)
+        loadJITCache()
     }
 
     deinit {
@@ -612,8 +630,15 @@ final class DBTEngine {
             return UnsafeRawPointer(bitPattern: UInt(entry.load(fromByteOffset: 8, as: UInt64.self)))
         }
         if let known = translations[key] {
-            if let known { install(key, code: known) }
-            return known
+            if let known {
+                if guestBytesMatch(key) {
+                    install(key, code: known)
+                    return known
+                }
+                discard(key)
+            } else {
+                return nil
+            }
         }
         guard let pageHost = ramHost(page) else {
             translations[key] = .some(nil)
@@ -624,6 +649,13 @@ final class DBTEngine {
         translations[key] = code
         keysByPage[page, default: []].append(key)
         keysByVirtualPage[pc & 0xFFFF_F000, default: []].append(key)
+        if let translation, let code {
+            let hash = Self.hashGuest(translation.guest, bytes: translation.guestBytes) ?? 0
+            blockCoverage[key] = Coverage(offset: code - UnsafeRawPointer(region.executable), length: translation.length,
+                                          physical: physical, guestBytes: translation.guestBytes, hash: hash,
+                                          virtualPage: pc & 0xFFFF_F000)
+            cacheDirty = true
+        }
         for slot in translation?.linkSlots ?? [] { slotOwners[slot] = key }
         if let code { install(key, code: code) }
         return code
@@ -638,7 +670,7 @@ final class DBTEngine {
     static var translationLimit = Int.max
     static var reportTranslation: ((UInt32, Bool, Int) -> Void)?
 
-    private func translate(virtual: UInt32, physical: UInt32, thumb: Bool, page: UnsafeRawPointer) -> (code: UnsafeRawPointer, linkSlots: [Int])? {
+    private func translate(virtual: UInt32, physical: UInt32, thumb: Bool, page: UnsafeRawPointer) -> (code: UnsafeRawPointer, linkSlots: [Int], length: Int, guest: UnsafeRawPointer, guestBytes: Int)? {
         guard statistics.blocksTranslated < Self.translationLimit else { return nil }
         let startWord = cursor / 4
         let counter = Self.recordBlocks && blockRecords.count < Self.maxCountedBlocks ? blockCounters + blockRecords.count : nil
@@ -660,14 +692,17 @@ final class DBTEngine {
         markCodePage(physical & 0xFFFF_F000)
         write(words, at: cursor)
         let code = UnsafeRawPointer(region.executable + cursor)
-        cursor = (cursor + words.count * 4 + 15) & ~15
+        let length = words.count * 4
+        let guestBytes = emitter.coveredBytes
+        let guest = page + Int(physical & 0xFFF)
+        cursor = (cursor + length + 15) & ~15
         statistics.blocksTranslated += 1
         statistics.guestInstructionsTranslated += translated
         Self.reportTranslation?(virtual, thumb, translated)
         if Self.recordBlocks {
-            blockRecords.append((code - UnsafeRawPointer(region.executable), words.count * 4, virtual | (thumb ? 1 : 0), translated))
+            blockRecords.append((code - UnsafeRawPointer(region.executable), length, virtual | (thumb ? 1 : 0), translated))
         }
-        return (code, emitter.linkSlots)
+        return (code, emitter.linkSlots, length, guest, guestBytes)
     }
 
     // MARK: Chaining
@@ -690,11 +725,183 @@ final class DBTEngine {
     private func discard(_ key: UInt64) {
         uninstall(key)
         translations[key] = nil
+        if blockCoverage.removeValue(forKey: key) != nil { cacheDirty = true }
         for slot in linksInto.removeValue(forKey: key) ?? [] {
             // `b` to the next instruction: the slot's unlinked path.
             write([0x1400_0001], at: slot * 4)
             statistics.unlinks += 1
         }
+    }
+
+    /// True when the guest bytes this block was built from are still there.
+    private func guestBytesMatch(_ key: UInt64) -> Bool {
+        guard let coverage = blockCoverage[key], coverage.guestBytes > 0 else { return true }
+        guard let page = ramHost(coverage.physical & 0xFFFF_F000) else { return false }
+        let guest = UnsafeRawPointer(page) + Int(coverage.physical & 0xFFF)
+        return Self.hashGuest(guest, bytes: coverage.guestBytes) == coverage.hash
+    }
+
+    private static func hashGuest(_ guest: UnsafeRawPointer?, bytes: Int) -> UInt64? {
+        guard let guest, bytes > 0, bytes <= 0x1000 else { return nil }
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for offset in 0..<bytes {
+            hash ^= UInt64(guest.load(fromByteOffset: offset, as: UInt8.self))
+            hash &*= 0x100_0000_01b3
+        }
+        return hash
+    }
+
+    // MARK: Disk cache
+
+    /// `jit_cache.bin` in the app's sandbox (Application Support). The
+    /// code is position-independent within the JIT region: branches aim
+    /// at the runtime stubs by word offset, so the bytes copy straight
+    /// into whatever address the dual mapping got this launch.
+    private static var cacheMagic: UInt32 { 0x4A49_5443 }
+    private static var cacheVersion: UInt32 { 1 }
+
+    private static var cacheURL: URL {
+        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory())
+        return base.appendingPathComponent("jit_cache.bin")
+    }
+
+    /// Writes the current translations. Called on the emulation thread,
+    /// once the lock screen is up and again when the session stops.
+    func checkpointJITCache() {
+        guard cacheDirty, !Self.recordBlocks, cursor > runtimeEnd, !blockCoverage.isEmpty else { return }
+        var data = Data()
+        func put<T: FixedWidthInteger>(_ value: T) {
+            var little = value.littleEndian
+            withUnsafeBytes(of: &little) { data.append(contentsOf: $0) }
+        }
+        var links: [(UInt32, UInt64)] = []
+        links.reserveCapacity(linksInto.count)
+        for (key, slots) in linksInto {
+            for slot in slots { links.append((UInt32(slot), key)) }
+        }
+        put(Self.cacheMagic)
+        put(Self.cacheVersion)
+        put(UInt32(runtimeEnd))
+        put(UInt32(cursor))
+        put(UInt32(blockCoverage.count))
+        put(UInt32(links.count))
+        put(UInt32(slotOwners.count))
+        put(UInt32(0))
+        for (key, coverage) in blockCoverage {
+            put(key)
+            put(UInt32(coverage.offset))
+            put(UInt32(coverage.length))
+            put(coverage.physical)
+            put(UInt32(max(coverage.guestBytes, 0)))
+            put(coverage.hash)
+            put(coverage.virtualPage)
+            put(UInt32(0))
+        }
+        for (slot, key) in links {
+            put(slot)
+            put(UInt32(0))
+            put(key)
+        }
+        for (slot, key) in slotOwners {
+            put(UInt32(slot))
+            put(UInt32(0))
+            put(key)
+        }
+        let imageCount = cursor - runtimeEnd
+        guard imageCount > 0, runtimeEnd + imageCount <= region.size else { return }
+        data.append(Data(bytes: region.writable.advanced(by: runtimeEnd), count: imageCount))
+        cacheDirty = false
+        let url = Self.cacheURL
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try data.write(to: url, options: .atomic)
+            PodiumLog.emulator.notice("jit cache saved \(blockCoverage.count, privacy: .public) blocks")
+        } catch {
+            cacheDirty = true
+            PodiumLog.emulator.error("jit cache write failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func loadJITCache() {
+        guard !Self.recordBlocks else { return }
+        let url = Self.cacheURL
+        guard let data = try? Data(contentsOf: url), data.count > 32 else { return }
+        var offset = 0
+        func take<T: FixedWidthInteger>(_ type: T.Type) -> T? {
+            let size = MemoryLayout<T>.size
+            guard offset + size <= data.count else { return nil }
+            let value = data.subdata(in: offset..<(offset + size)).withUnsafeBytes { raw -> T in
+                var loaded = T.zero
+                withUnsafeMutableBytes(of: &loaded) { $0.copyBytes(from: raw) }
+                return T(littleEndian: loaded)
+            }
+            offset += size
+            return value
+        }
+        guard let magic = take(UInt32.self), magic == Self.cacheMagic,
+              let version = take(UInt32.self), version == Self.cacheVersion else { return }
+        guard let storedRuntime = take(UInt32.self), let imageEnd = take(UInt32.self),
+              let blockCount = take(UInt32.self), let linkCount = take(UInt32.self),
+              let slotCount = take(UInt32.self), take(UInt32.self) != nil else { return }
+        guard storedRuntime == UInt32(runtimeEnd), imageEnd >= storedRuntime,
+              Int(imageEnd) <= region.size, blockCount < 2_000_000, linkCount < 4_000_000, slotCount < 4_000_000 else { return }
+        struct Record {
+            var key: UInt64
+            var codeOffset: Int
+            var length: Int
+            var physical: UInt32
+            var guestBytes: Int
+            var hash: UInt64
+            var virtualPage: UInt32
+        }
+        var records: [Record] = []
+        records.reserveCapacity(Int(blockCount))
+        for _ in 0..<blockCount {
+            guard let key = take(UInt64.self), let codeOffset = take(UInt32.self), let length = take(UInt32.self),
+                  let physical = take(UInt32.self), let guestBytes = take(UInt32.self), let hash = take(UInt64.self),
+                  let virtualPage = take(UInt32.self), take(UInt32.self) != nil else { return }
+            let start = Int(codeOffset), bytes = Int(length)
+            guard start >= runtimeEnd, bytes > 0, start + bytes <= Int(imageEnd) else { return }
+            records.append(Record(key: key, codeOffset: start, length: bytes, physical: physical,
+                                  guestBytes: Int(guestBytes), hash: hash, virtualPage: virtualPage))
+        }
+        var links: [(Int, UInt64)] = []
+        for _ in 0..<linkCount {
+            guard let slot = take(UInt32.self), take(UInt32.self) != nil, let key = take(UInt64.self) else { return }
+            links.append((Int(slot), key))
+        }
+        var slots: [(Int, UInt64)] = []
+        for _ in 0..<slotCount {
+            guard let slot = take(UInt32.self), take(UInt32.self) != nil, let key = take(UInt64.self) else { return }
+            slots.append((Int(slot), key))
+        }
+        let imageCount = Int(imageEnd) - runtimeEnd
+        guard offset + imageCount <= data.count else { return }
+        let image = data.subdata(in: offset..<(offset + imageCount))
+        region.write(at: runtimeEnd, length: imageCount) { destination in
+            image.withUnsafeBytes { raw in
+                if let base = raw.baseAddress { destination.copyMemory(from: base, byteCount: imageCount) }
+            }
+        }
+        for record in records {
+            let code = UnsafeRawPointer(region.executable + record.codeOffset)
+            translations[record.key] = code
+            blockCoverage[record.key] = Coverage(offset: record.codeOffset, length: record.length, physical: record.physical,
+                                                  guestBytes: record.guestBytes, hash: record.hash, virtualPage: record.virtualPage)
+            let page = record.physical & 0xFFFF_F000
+            keysByPage[page, default: []].append(record.key)
+            keysByVirtualPage[record.virtualPage, default: []].append(record.key)
+            markCodePage(page)
+            install(record.key, code: code)
+        }
+        for (slot, key) in links { linksInto[key, default: []].append(slot) }
+        for (slot, key) in slots { slotOwners[slot] = key }
+        cursor = Int(imageEnd)
+        statistics.blocksTranslated += records.count
+        restoredBlocks = records.count
+        cacheDirty = false
+        PodiumLog.emulator.notice("jit cache loaded \(records.count, privacy: .public) blocks")
     }
 
     // MARK: Invalidation
@@ -708,13 +915,39 @@ final class DBTEngine {
         cpu.withholdWriteHosts(forPhysicalPage: page)
     }
 
-    /// A store changed a page code was translated from: forget it all.
-    func codeWasWritten(physicalPage page: UInt32) {
+    /// A store landed on a page code was translated from. Blocks whose
+    /// guest bytes are unchanged stay; only a block the store actually
+    /// rewrote is discarded. The page leaves the bitmap once none remain.
+    func codeWasWritten(physicalPage page: UInt32, at address: UInt32, width: Int) {
         let index = Int((page &- ramBase) >> 12)
-        guard index >= 0, index < ramPages else { return }
-        codePageBitmap[index >> 6] &= ~(UInt64(1) << UInt64(index & 63))
-        for key in keysByPage.removeValue(forKey: page) ?? [] { discard(key) }
-        cpu.restoreWriteHosts(forPhysicalPage: page)
+        guard index >= 0, index < ramPages, var keys = keysByPage[page] else { return }
+        let writeEnd = address &+ UInt32(width)
+        var dropped = false
+        keys.removeAll { key in
+            guard let coverage = blockCoverage[key] else { return false }
+            let blockEnd = coverage.physical &+ UInt32(coverage.guestBytes)
+            guard coverage.guestBytes > 0 else {
+                discard(key)
+                dropped = true
+                return true
+            }
+            guard address < blockEnd, writeEnd > coverage.physical else { return false }
+            let guest = ramHost(coverage.physical & 0xFFFF_F000).map { UnsafeRawPointer($0) + Int(coverage.physical & 0xFFF) }
+            if let hash = Self.hashGuest(guest, bytes: coverage.guestBytes), hash == coverage.hash {
+                return false
+            }
+            discard(key)
+            dropped = true
+            return true
+        }
+        guard dropped || keys.isEmpty else { return }
+        if keys.isEmpty {
+            keysByPage[page] = nil
+            codePageBitmap[index >> 6] &= ~(UInt64(1) << UInt64(index & 63))
+            cpu.restoreWriteHosts(forPhysicalPage: page)
+        } else {
+            keysByPage[page] = keys
+        }
         statistics.pagesInvalidated += 1
     }
 
@@ -729,6 +962,8 @@ final class DBTEngine {
         linksInto.removeAll(keepingCapacity: true)
         if Self.recordBlocks { foldBlockCounts() }
         blockRecords.removeAll(keepingCapacity: true)
+        blockCoverage.removeAll(keepingCapacity: true)
+        cacheDirty = true
         codePageBitmap.update(repeating: 0, count: (ramPages + 63) / 64)
         cpu.flushTLB()
         cursor = runtimeEnd

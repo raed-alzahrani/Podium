@@ -68,7 +68,7 @@ final class HostAudioOutput: AudioOutput {
     func enqueue(samples: [Float]) {
         guard !samples.isEmpty else { return }
         audible = true
-        ring.write(samples)
+        ring.enqueue(samples, now: CFAbsoluteTimeGetCurrent())
         guard OSAtomicCompareAndSwap32Barrier(0, 1, startQueued) else { return }
         DispatchQueue.main.async { [weak self] in
             self?.startEngine()
@@ -194,17 +194,10 @@ final class HostAudioOutput: AudioOutput {
         }
         let taken = ring.read(frames: frames, left: left, right: right)
         if taken < frames {
+            // The click's own samples stay at full level. Only the part of
+            // this slice the ring does not have yet is silence, so a lock
+            // tail already queued is not faded out when the channel stops.
             silence(left.advanced(by: taken), right.advanced(by: taken), frames - taken)
-            let ramp = min(32, taken)
-            if ramp > 1 {
-                let span = Float(ramp)
-                for index in 0..<ramp {
-                    let gain = Float(ramp - index) / span
-                    let sample = taken - ramp + index
-                    left[sample] *= gain
-                    right[sample] *= gain
-                }
-            }
         }
         return noErr
     }
@@ -295,6 +288,9 @@ private final class PCMRing {
     private let writeIndex: UnsafeMutablePointer<Int32>
     private let readIndex: UnsafeMutablePointer<Int32>
     private let producer = NSLock()
+    /// Last accepted burst. A later short burst while samples are still
+    /// queued is a second click, mixed on top instead of queued behind.
+    private var lastEnqueueTime: CFAbsoluteTime = 0
 
     init() {
         storage = .allocate(capacity: Self.capacity)
@@ -311,26 +307,58 @@ private final class PCMRing {
         readIndex.deallocate()
     }
 
-    /// Interleaved stereo. Drops the tail only when the ring is already full,
-    /// so a short write that fits is never overwritten.
-    func write(_ samples: [Float]) {
+    /// Interleaved stereo. A short burst that arrives while another is
+    /// still queued is added into those samples, so a second key click
+    /// does not replace or wait out the first. A continuous stream
+    /// (chunks closer together than a frame) is appended.
+    func enqueue(_ samples: [Float], now: CFAbsoluteTime) {
         let count = samples.count & ~1
         guard count > 0 else { return }
         producer.lock()
         defer { producer.unlock() }
+        let frames = count / 2
+        let gap = now - lastEnqueueTime
+        lastEnqueueTime = now
         let write = OSAtomicAdd32Barrier(0, writeIndex)
         let read = OSAtomicAdd32Barrier(0, readIndex)
+        let unreadFrames = max(0, Int(write &- read) / 2)
+        let mix = gap > 0.03 && frames <= 1_024 && unreadFrames > 0 && unreadFrames < 2_048
+        samples.withUnsafeBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            if mix {
+                add(base, count: count, onto: read, queuedFloats: unreadFrames * 2, write: write)
+            } else {
+                append(base, count: count, write: write, read: read)
+            }
+        }
+    }
+
+    /// Adds `count` interleaved floats onto the unread region, then
+    /// appends whatever extends past it. Nothing already queued is cleared.
+    private func add(_ base: UnsafePointer<Float>, count: Int, onto read: Int32, queuedFloats: Int, write: Int32) {
+        let overlap = min(count, queuedFloats)
+        var cursor = Int(read)
+        for offset in 0..<overlap {
+            let mixed = storage[cursor & Self.mask] + base[offset]
+            storage[cursor & Self.mask] = mixed > 1 ? 1 : (mixed < -1 ? -1 : mixed)
+            cursor += 1
+        }
+        if count > overlap {
+            append(base.advanced(by: overlap), count: count - overlap, write: write, read: read)
+        }
+    }
+
+    /// Copies onto the write cursor. Drops only the tail that does not fit,
+    /// so a short write already in the ring is never overwritten.
+    private func append(_ base: UnsafePointer<Float>, count: Int, write: Int32, read: Int32) {
         let occupied = Int(write &- read)
         let space = max(0, Self.capacity - occupied) & ~1
         let n = min(count, space)
         guard n > 0 else { return }
-        samples.withUnsafeBufferPointer { buffer in
-            guard let base = buffer.baseAddress else { return }
-            var cursor = Int(write)
-            for offset in 0..<n {
-                storage[cursor & Self.mask] = base[offset]
-                cursor += 1
-            }
+        var cursor = Int(write)
+        for offset in 0..<n {
+            storage[cursor & Self.mask] = base[offset]
+            cursor += 1
         }
         OSAtomicAdd32Barrier(Int32(n), writeIndex)
     }
