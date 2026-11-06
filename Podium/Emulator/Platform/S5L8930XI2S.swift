@@ -133,8 +133,10 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
             let left = Int16(bitPattern: UInt16(pending[index]) | UInt16(pending[index + 1]) << 8)
             let right = Int16(bitPattern: UInt16(pending[index + 2]) | UInt16(pending[index + 3]) << 8)
             pendingRead += 4
-            frames.append(Float(left) / 32768)
-            frames.append(Float(right) / 32768)
+            // Signed 16-bit PCM → Float32 in -1...1. The host mixer
+            // rejects raw int16 bit patterns; 32768 is the full-scale step.
+            frames.append(Float(left) / 32768.0)
+            frames.append(Float(right) / 32768.0)
             if frames.count >= 512 { deliver() }
         }
         if pendingRead > 4096 {

@@ -4,101 +4,64 @@ import os
 
 /// Plays guest PCM, and the lock click, through `AVAudioEngine`.
 ///
-/// The render callback pulls from a short ring. Guest audio that arrives
-/// faster than the device plays it drops the oldest samples, so a burst
-/// cannot pile up into seconds of latency. Silence fills whatever the
-/// guest has not produced yet.
+/// Guest samples are already stereo Float32 in -1...1 (signed 16-bit PCM
+/// divided by 32768). Each chunk is scheduled on an `AVAudioPlayerNode`
+/// in that same format. The session stays `.playback` with
+/// `.mixWithOthers`, which is what makes iOS ignore the hardware mute
+/// switch; `.ambient` would stay silent with the switch on.
 ///
-/// Samples are appended off the emulation thread. The guest runloop is
-/// the thread that just finished a DMA store; waiting there on the
-/// render callback's lock (or on `AVAudioEngine`) stalls every guest
-/// thread behind it, including SpringBoard during the unlock animation.
-/// Session activation stays on the main thread: an engine started before
-/// `AVAudioSession` is active plays silence, and iOS will not route
-/// buffers from a session that was never made active.
+/// Nothing here runs on the emulation thread. A DMA completion only
+/// copies the samples and hops to the main queue, where the engine lives.
 final class HostAudioOutput: AudioOutput {
     var volume: Float = 1 {
         didSet { engine.mainMixerNode.outputVolume = volume }
     }
 
     private let engine = AVAudioEngine()
-    private var source: AVAudioSourceNode?
+    private let player = AVAudioPlayerNode()
     private let format: AVAudioFormat
     private let lock = NSLock()
-    private let scheduleLock = NSLock()
-    private let enqueueQueue = DispatchQueue(label: "podium.audio.enqueue", qos: .userInteractive)
-    private var ring: [Float]
-    private var readIndex = 0
-    private var available = 0
     private var lockSound: [Float]
     private var preparedRoot: URL?
-    /// Set once category + setActive have succeeded. Until then a running
-    /// engine is restarted, because the first start often happens before
-    /// the app is allowed to play.
-    private var needsSessionRestart = true
-    private var playbackLive = false
-    private var playbackScheduled = false
-    private var loggedRender = false
-    private var loggedSessionFailure = false
-    /// One line when the session comes up, when it fails, and the first
-    /// time the render callback actually pulls the ring.
+    private var audible = false
+    private var loggedFailure = false
+    private var loggedStart = false
+    /// One line when the session comes up or the engine refuses to start.
     var onDiagnostic: ((String) -> Void)?
 
     init() {
         format = AVAudioFormat(standardFormatWithSampleRate: Double(S5L8930XI2S.sampleRate), channels: 2)!
-        ring = [Float](repeating: 0, count: S5L8930XI2S.sampleRate * 2)
         lockSound = Self.click(sampleRate: S5L8930XI2S.sampleRate)
-        let source = AVAudioSourceNode { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
-            self?.render(frameCount: frameCount, list: audioBufferList)
-            return noErr
-        }
-        self.source = source
-        engine.attach(source)
-        engine.connect(source, to: engine.mainMixerNode, format: format)
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = 1
+        player.volume = 1
         engine.isAutoShutdownEnabled = false
-        // The engine is not started here. Init usually runs before iOS
-        // will activate a session, and an engine that is already "running"
-        // from that attempt stays silent for the rest of the launch.
     }
-
-    private var audible = false
 
     var guestAudioIsAudible: Bool { audible }
 
     func enqueue(samples: [Float]) {
         guard !samples.isEmpty else { return }
-        // The emulation thread must not take `lock` or call into
-        // AVAudioSession. Both can wait on the render callback, and a
-        // wait there freezes the guest on the Apple logo. The samples
-        // go into the ring first; the main thread brings the session up.
         audible = true
         let copy = samples
-        enqueueQueue.async { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            self.append(copy)
-            self.lock.unlock()
+        DispatchQueue.main.async { [weak self] in
+            self?.schedule(copy)
         }
-        requestPlayback()
     }
 
     func pause() {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
+            self.player.pause()
             self.engine.pause()
-            self.scheduleLock.lock()
-            self.playbackLive = false
-            self.scheduleLock.unlock()
         }
     }
 
     func resume() {
         DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.scheduleLock.lock()
-            self.playbackLive = false
-            self.scheduleLock.unlock()
-            self.startEngine()
+            self?.startEngine()
+            self?.player.play()
         }
     }
 
@@ -121,171 +84,75 @@ final class HostAudioOutput: AudioOutput {
         let samples = lockSound
         lock.unlock()
         guard !samples.isEmpty else { return }
-        let copy = samples
-        enqueueQueue.async { [weak self] in
-            guard let self else { return }
-            self.lock.lock()
-            self.append(copy)
-            self.lock.unlock()
-        }
-        requestPlayback()
+        enqueue(samples: samples)
     }
 
-    /// Hops to the main thread without waiting. `AVAudioSession` and
-    /// `AVAudioEngine` both have to be touched there; doing it on the
-    /// enqueue queue deadlocks the mixer behind the guest. One request
-    /// is enough until that hop runs — a playing guest enqueues hundreds
-    /// of times a second.
-    private func requestPlayback() {
-        scheduleLock.lock()
-        if playbackLive || playbackScheduled {
-            scheduleLock.unlock()
-            return
-        }
-        playbackScheduled = true
-        scheduleLock.unlock()
-        let fire = { [weak self] in
-            guard let self else { return }
-            self.startEngine()
-            self.scheduleLock.lock()
-            self.playbackScheduled = false
-            self.scheduleLock.unlock()
-        }
-        if Thread.isMainThread {
-            fire()
-        } else {
-            DispatchQueue.main.async(execute: fire)
-        }
+    /// `.playback` ignores the hardware mute switch. Re-applied whenever
+    /// the player is idle or something else has moved the session off
+    /// playback, so a later chunk cannot inherit `.ambient`.
+    private func activateSession() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
+        try? session.setPreferredSampleRate(Double(S5L8930XI2S.sampleRate))
+        try session.setActive(true)
+        try? session.overrideOutputAudioPort(.speaker)
     }
 
     private func startEngine() {
         let session = AVAudioSession.sharedInstance()
-        if needsSessionRestart {
-            if engine.isRunning { engine.stop() }
+        let needsCategory = session.category != .playback || !player.isPlaying || !engine.isRunning
+        if needsCategory {
             do {
-                try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
-                try? session.setPreferredSampleRate(Double(S5L8930XI2S.sampleRate))
-                try session.setActive(true)
-                needsSessionRestart = false
+                try activateSession()
+                loggedFailure = false
             } catch {
-                needsSessionRestart = true
-                if !loggedSessionFailure {
-                    loggedSessionFailure = true
+                if !loggedFailure {
+                    loggedFailure = true
                     let message = "audio| AVAudioSession failed: \(error.localizedDescription)"
                     PodiumLog.emulator.error("\(message, privacy: .public)")
                     onDiagnostic?(message)
                 }
+                return
             }
         }
-        guard !needsSessionRestart else {
-            scheduleLock.lock()
-            playbackLive = false
-            scheduleLock.unlock()
-            return
-        }
-        if let source {
-            engine.connect(source, to: engine.mainMixerNode, format: format)
-        }
-        engine.mainMixerNode.outputVolume = volume
         if !engine.isRunning {
             engine.prepare()
             do {
                 try engine.start()
             } catch {
-                if !loggedSessionFailure {
-                    loggedSessionFailure = true
+                if !loggedFailure {
+                    loggedFailure = true
                     let message = "audio| engine start failed: \(error.localizedDescription)"
                     PodiumLog.emulator.error("\(message, privacy: .public)")
                     onDiagnostic?(message)
                 }
-                scheduleLock.lock()
-                playbackLive = false
-                scheduleLock.unlock()
                 return
             }
         }
-        loggedSessionFailure = false
-        scheduleLock.lock()
-        playbackLive = engine.isRunning
-        scheduleLock.unlock()
-        let message = "audio| engine running, session \(session.sampleRate) Hz, mixer pulling"
+        engine.mainMixerNode.outputVolume = volume
+        if !player.isPlaying { player.play() }
+        guard !loggedStart else { return }
+        loggedStart = true
+        let message = "audio| playback session active (mixWithOthers), speaker, float32 \(format.sampleRate) Hz"
         PodiumLog.emulator.notice("\(message, privacy: .public)")
         onDiagnostic?(message)
     }
 
-    private func append(_ samples: [Float]) {
-        if samples.count >= ring.count {
-            let tail = samples.suffix(ring.count)
-            for sample in tail {
-                ring[(readIndex + available) % ring.count] = sample
-                if available == ring.count { readIndex = (readIndex + 1) % ring.count } else { available += 1 }
-            }
-            return
+    /// `samples` is interleaved stereo Float32, already scaled from int16.
+    private func schedule(_ samples: [Float]) {
+        startEngine()
+        guard engine.isRunning, player.isPlaying else { return }
+        let frames = AVAudioFrameCount(samples.count / 2)
+        guard frames > 0,
+              let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frames),
+              let channels = buffer.floatChannelData else { return }
+        buffer.frameLength = frames
+        let count = Int(frames)
+        for frame in 0..<count {
+            channels[0][frame] = samples[frame * 2]
+            channels[1][frame] = samples[frame * 2 + 1]
         }
-        for sample in samples {
-            ring[(readIndex + available) % ring.count] = sample
-            if available == ring.count { readIndex = (readIndex + 1) % ring.count } else { available += 1 }
-        }
-    }
-
-    private func render(frameCount: AVAudioFrameCount, list: UnsafeMutablePointer<AudioBufferList>) {
-        let buffers = UnsafeMutableAudioBufferListPointer(list)
-        guard !buffers.isEmpty, let left = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
-        let count = Int(frameCount)
-        let channels = max(1, Int(buffers[0].mNumberChannels))
-        let split = buffers.count > 1
-        let right = split ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
-        // Never block the device callback. If the enqueue queue holds the
-        // ring, this quantum plays silence and the next one catches up;
-        // blocking here backs up into the emulation thread's enqueue.
-        guard lock.`try`() else {
-            writeSilence(left: left, right: right, split: split, channels: channels, from: 0, to: count)
-            return
-        }
-        let frames = min(count, available / 2)
-        if !loggedRender {
-            loggedRender = true
-            let message = "audio| host pulled \(frames) of \(count) frames, ring held \(available) samples"
-            PodiumLog.emulator.notice("\(message, privacy: .public)")
-            onDiagnostic?(message)
-        }
-        for frame in 0..<frames {
-            let leftSample = ring[readIndex]
-            readIndex = (readIndex + 1) % ring.count
-            let rightSample = ring[readIndex]
-            readIndex = (readIndex + 1) % ring.count
-            available -= 2
-            write(leftSample: leftSample, rightSample: rightSample, frame: frame, left: left, right: right, split: split, channels: channels)
-        }
-        lock.unlock()
-        if frames < count {
-            writeSilence(left: left, right: right, split: split, channels: channels, from: frames, to: count)
-        }
-    }
-
-    private func write(leftSample: Float, rightSample: Float, frame: Int, left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>?, split: Bool, channels: Int) {
-        if split {
-            left[frame] = leftSample
-            right?[frame] = rightSample
-        } else if channels == 1 {
-            left[frame] = (leftSample + rightSample) * 0.5
-        } else {
-            left[frame * channels] = leftSample
-            left[frame * channels + 1] = rightSample
-        }
-    }
-
-    private func writeSilence(left: UnsafeMutablePointer<Float>, right: UnsafeMutablePointer<Float>?, split: Bool, channels: Int, from: Int, to: Int) {
-        if split {
-            for frame in from..<to {
-                left[frame] = 0
-                right?[frame] = 0
-            }
-        } else {
-            let begin = from * channels
-            let end = to * channels
-            for index in begin..<end { left[index] = 0 }
-        }
+        player.scheduleBuffer(buffer)
     }
 
     /// `lock.caf` from the prepared system image, as stereo float at the
