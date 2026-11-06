@@ -7,6 +7,11 @@ import Foundation
 /// faster than the device plays it drops the oldest samples, so a burst
 /// cannot pile up into seconds of latency. Silence fills whatever the
 /// guest has not produced yet.
+///
+/// Samples are appended off the emulation thread. The guest runloop is
+/// the thread that just finished a DMA store; waiting there on the
+/// render callback's lock (or on `AVAudioEngine`) stalls every guest
+/// thread behind it, including SpringBoard during the unlock animation.
 final class HostAudioOutput: AudioOutput {
     var volume: Float = 1 {
         didSet { engine.mainMixerNode.outputVolume = volume }
@@ -15,6 +20,7 @@ final class HostAudioOutput: AudioOutput {
     private let engine = AVAudioEngine()
     private let format: AVAudioFormat
     private let lock = NSLock()
+    private let enqueueQueue = DispatchQueue(label: "podium.audio.enqueue", qos: .userInteractive)
     private var ring: [Float]
     private var readIndex = 0
     private var available = 0
@@ -45,8 +51,14 @@ final class HostAudioOutput: AudioOutput {
         guard !samples.isEmpty else { return }
         lock.lock()
         receivedGuestAudio = true
-        append(samples)
         lock.unlock()
+        let copy = samples
+        enqueueQueue.async { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            self.append(copy)
+            self.lock.unlock()
+        }
     }
 
     func pause() {
@@ -109,7 +121,16 @@ final class HostAudioOutput: AudioOutput {
         let buffers = UnsafeMutableAudioBufferListPointer(list)
         guard let left = buffers[0].mData?.assumingMemoryBound(to: Float.self) else { return }
         let right = buffers.count > 1 ? buffers[1].mData?.assumingMemoryBound(to: Float.self) : nil
-        lock.lock()
+        // Never block the device callback. If the enqueue queue holds the
+        // ring, this quantum plays silence and the next one catches up;
+        // blocking here backs up into the emulation thread's enqueue.
+        guard lock.`try`() else {
+            for frame in 0..<Int(frameCount) {
+                left[frame] = 0
+                right?[frame] = 0
+            }
+            return
+        }
         let frames = min(Int(frameCount), available / 2)
         for frame in 0..<frames {
             left[frame] = ring[readIndex]

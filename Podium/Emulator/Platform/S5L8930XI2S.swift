@@ -15,32 +15,72 @@ import Foundation
 /// DMA contributes the same little-endian bytes. Pairs of samples are
 /// stereo frames at 44.1 kHz, handed to `output`. The FIFO never reports
 /// full, so a driver that streams does not stall the guest.
+///
+/// DMA into the FIFO is paced at the sample clock (`dmaSpace` stays at
+/// one or two frames of audio). Completing `unlock.caf` inside the store
+/// that started it raises the done interrupt before the audio work loop
+/// can sleep; that loop then resubmits forever and the main thread —
+/// SpringBoard's unlock animation — never runs. Bytes that arrive for a
+/// register the endpoint table doesn't name are staged and released on
+/// the same clock.
 final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     static let windowLength: UInt32 = 0xC00
     static let controlChannelIdle: UInt32 = 1 << 1
     static let controlActive: UInt32 = 1
     static let transmitData: UInt32 = 0x10
     static let sampleRate = 44_100
+    /// Stereo s16 for one 60 Hz guest frame. 44100 divides evenly by 60.
+    static let bytesPerFrame = sampleRate / 60 * 4
 
     var output: AudioOutput?
     private var registers = [UInt32](repeating: 0, count: Int(windowLength / 4))
     private var pending: [UInt8] = []
     private var frames: [Float] = []
+    /// How many DMA bytes the sample clock has released and the channel
+    /// has not taken yet.
+    private var dmaBudget = 0
+    /// A whole buffer handed over before its sample time, drained by
+    /// `refillTransmitBudget`.
+    private var staged: [UInt8] = []
+    private var stagedRead = 0
 
-    var dmaSpace: Int { 1 << 20 }
+    var dmaSpace: Int { dmaBudget }
     func dmaPush(_ byte: UInt8) {
+        guard dmaBudget > 0 else { return }
+        dmaBudget -= 1
         accept(byte)
     }
     var dmaAvailable: Int { 0 }
     func dmaPop() -> UInt8 { 0 }
 
     /// A whole DMA buffer, played whether or not control bit 0 is set.
-    /// Programmed writes of the transmit register still wait for that bit;
-    /// a DMA submit must both play and finish without waiting for it.
+    /// Programmed writes of the transmit register still wait for that bit.
+    /// The bytes wait for the sample clock instead of entering the host
+    /// mixer inside the guest's start-DMA store.
     func ingest(_ bytes: [UInt8]) {
         guard !bytes.isEmpty else { return }
-        for byte in bytes { accept(byte) }
+        compactStagedIfNeeded()
+        staged.append(contentsOf: bytes)
+    }
+
+    /// Releases one guest frame of transmit audio. Called from the frame
+    /// tick, not from the store that queued the buffer.
+    func refillTransmitBudget() {
+        let quantum = Self.bytesPerFrame
+        dmaBudget = min(dmaBudget + quantum, quantum * 2)
+        let available = staged.count - stagedRead
+        let release = min(quantum, available)
+        guard release > 0 else { return }
+        for byte in staged[stagedRead..<(stagedRead + release)] { accept(byte) }
+        stagedRead += release
         flush()
+        compactStagedIfNeeded()
+    }
+
+    private func compactStagedIfNeeded() {
+        guard stagedRead > 0, stagedRead == staged.count || stagedRead > 16_384 else { return }
+        staged.removeFirst(stagedRead)
+        stagedRead = 0
     }
 
     func readRegister(at offset: UInt32) -> UInt32 {

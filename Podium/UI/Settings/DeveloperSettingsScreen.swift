@@ -44,7 +44,7 @@ struct DeveloperSettingsScreen: View {
             }
 
             Section {
-                Button("Turn on JIT") {
+                Button("Open StikDebug") {
                     openStikDebug()
                 }
                 LabeledContent("Status", value: jitActive ? "Active" : "Not active")
@@ -78,7 +78,13 @@ struct DeveloperSettingsScreen: View {
                     .foregroundStyle(.secondary)
             }
 
-            Section("Emulator Log") {
+            Section {
+                Button("Copy Logs") {
+                    UIPasteboard.general.string = emulatorCore.fullLogText
+                }
+                Button("Share Logs") {
+                    shareLogs()
+                }
                 if emulatorCore.log.isEmpty {
                     Text("No activity yet.")
                         .foregroundStyle(.secondary)
@@ -94,6 +100,8 @@ struct DeveloperSettingsScreen: View {
                         .padding(.vertical, 2)
                     }
                 }
+            } header: {
+                Text("Emulator Log")
             }
 
             Section {
@@ -108,8 +116,29 @@ struct DeveloperSettingsScreen: View {
         .alert("StikDebug isn't available", isPresented: $stikDebugUnavailable) {
             Button("OK", role: .cancel) {}
         } message: {
-            Text("Install StikDebug, then try Turn on JIT again.")
+            Text("Install StikDebug, then try Open StikDebug again.")
         }
+    }
+
+    /// The persisted log, shared as plain text.
+    private func shareLogs() {
+        let controller = UIActivityViewController(activityItems: [emulatorCore.fullLogText], applicationActivities: nil)
+        guard let presenter = Self.topViewController() else { return }
+        if let popover = controller.popoverPresentationController {
+            popover.sourceView = presenter.view
+            popover.sourceRect = CGRect(x: presenter.view.bounds.midX, y: presenter.view.bounds.maxY - 1, width: 1, height: 1)
+            popover.permittedArrowDirections = []
+        }
+        presenter.present(controller, animated: true)
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let root = scenes.flatMap(\.windows).first(where: \.isKeyWindow)?.rootViewController
+            ?? scenes.first?.windows.first?.rootViewController
+        var presenter = root
+        while let presented = presenter?.presentedViewController { presenter = presented }
+        return presenter
     }
 
     private func openStikDebug() {

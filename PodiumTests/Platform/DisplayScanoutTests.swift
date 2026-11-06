@@ -51,4 +51,26 @@ final class DisplayScanoutTests: XCTestCase {
         XCTAssertEqual(frame(), [0xFF11_1111, 0xFF22_2222, 0xFF00_0000, 0xFF00_0000,
                                  0xFF33_3333, 0xFF44_4444, 0xFF00_0000, 0xFF00_0000])
     }
+
+    /// The lock-screen surface stays up while the home-screen surface is
+    /// not mapped yet, instead of the boot framebuffer replacing it for
+    /// that frame.
+    func testUnmappedSwapKeepsThePresentedFrame() throws {
+        let bootAddress: UInt32 = 0x4001_0000
+        try ram.writeWord32(0xFF12_3456, at: bootAddress)
+        for index in 0..<8 {
+            try ram.writeWord32(0xFFAB_CDEF, at: 0x4000_2000 + UInt32(index * 4))
+        }
+        let layer = DisplayScanout.pipeBase + DisplayScanout.layerOffsets[0]
+        try bus.writeWord32(1, at: layer)
+        try bus.writeWord32(0x4000_2000, at: layer + 4)
+        try bus.writeWord32(16, at: layer + 8)
+        try bus.writeWord32(4 << 16 | 2, at: layer + 0x20)
+        let shown = frame()
+        XCTAssertEqual(shown[0], 0xFFAB_CDEF)
+
+        try bus.writeWord32(0xEEEE_0000, at: layer + 4)
+        XCTAssertEqual(frame(), shown, "an unmapped swap must not drop the frame that is already on screen")
+        XCTAssertNotEqual(frame()[0], 0xFF12_3456)
+    }
 }

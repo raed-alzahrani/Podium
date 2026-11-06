@@ -40,6 +40,29 @@ final class S5L8930XDisplayTests: XCTestCase {
         XCTAssertEqual(pipe.readRegister(at: S5L8930XDisplayPipe.interruptStatus), S5L8930XDisplayPipe.vblank | S5L8930XDisplayPipe.commandDone)
     }
 
+    /// Two swaps queued in one frame must not collapse into the later
+    /// surface. IOMobileFramebuffer waits on each command's ID, and the
+    /// one in front has to scan out for a frame.
+    func testOneSwapIsLatchedPerFrame() {
+        let pipe = S5L8930XDisplayPipe { _ in }
+        func submit(id: UInt32, address: UInt32) {
+            let words: [UInt32] = [0x0001_4044, address]
+            pipe.writeRegister(0x8000_0000 | UInt32(words.count) << 16 | id, at: S5L8930XDisplayPipe.commandFIFO)
+            for word in words { pipe.writeRegister(word, at: S5L8930XDisplayPipe.commandFIFO) }
+        }
+        submit(id: 1, address: 0x1000_0000)
+        submit(id: 2, address: 0x2000_0000)
+
+        pipe.frameEnded()
+        XCTAssertEqual(pipe.readRegister(at: 0x4044), 0x1000_0000)
+        XCTAssertEqual(pipe.readRegister(at: S5L8930XDisplayPipe.completedCommandID), 1)
+
+        pipe.writeRegister(S5L8930XDisplayPipe.vblank | S5L8930XDisplayPipe.commandDone, at: S5L8930XDisplayPipe.interruptStatus)
+        pipe.frameEnded()
+        XCTAssertEqual(pipe.readRegister(at: 0x4044), 0x2000_0000)
+        XCTAssertEqual(pipe.readRegister(at: S5L8930XDisplayPipe.completedCommandID), 2)
+    }
+
     /// AppleCLCD's filter checks status bit 2 and acknowledges it; the
     /// iBoot-state registers it reads at start are plain storage.
     func testCLCDVsyncStatusAndPlainRegisters() {

@@ -39,6 +39,12 @@ final class DisplayScanout: FramebufferSource {
     private let bootFramebuffer: FramebufferSource
     let pixelWidth: Int
     let pixelHeight: Int
+    /// The last surface that actually scanned out. A swap that lands
+    /// before its pages are mapped, or a frame whose layer is disabled
+    /// while the next surface is still queued, keeps this instead of
+    /// falling through to the boot framebuffer — that fallthrough is a
+    /// dropped frame between the lock screen and the application grid.
+    private var presentedFrame: [UInt32] = []
 
     init(memory: MemoryBus, dart: S5L8930XDART, bootFramebuffer: FramebufferSource) {
         self.memory = memory
@@ -69,11 +75,34 @@ final class DisplayScanout: FramebufferSource {
             return
         }
         let layers = activeLayers
-        guard !layers.isEmpty else { return bootFramebuffer.copyCurrentFrame(into: buffer) }
+        let translated = dart.hasSegments(stream: Self.clcdStream)
+        let fetchable = layers.contains { hostAddress(ofDevice: $0.address, translated: translated) != nil }
+        if layers.isEmpty || !fetchable {
+            if copyPresentedFrame(into: output) { return }
+            guard !layers.isEmpty else { return bootFramebuffer.copyCurrentFrame(into: buffer) }
+        }
         for index in 0..<(pixelWidth * pixelHeight) { output[index] = 0xFF00_0000 }
         for (index, layer) in layers.enumerated() {
             draw(layer, into: output, blend: index > 0)
         }
+        if fetchable { rememberPresentedFrame(from: output) }
+    }
+
+    private func copyPresentedFrame(into output: UnsafeMutableBufferPointer<UInt32>) -> Bool {
+        let count = pixelWidth * pixelHeight
+        guard presentedFrame.count == count, let destination = output.baseAddress else { return false }
+        presentedFrame.withUnsafeBufferPointer { source in
+            guard let base = source.baseAddress else { return }
+            destination.update(from: base, count: count)
+        }
+        return true
+    }
+
+    private func rememberPresentedFrame(from output: UnsafeMutableBufferPointer<UInt32>) {
+        let count = pixelWidth * pixelHeight
+        guard let source = output.baseAddress else { return }
+        if presentedFrame.count != count { presentedFrame = [UInt32](repeating: 0, count: count) }
+        presentedFrame.withUnsafeMutableBufferPointer { $0.baseAddress?.update(from: source, count: count) }
     }
 
     /// Fetches one layer row by row through the DART. Rows can straddle

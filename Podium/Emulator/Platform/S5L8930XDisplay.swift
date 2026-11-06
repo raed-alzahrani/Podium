@@ -62,16 +62,21 @@ final class S5L8930XDisplayPipe: MMIODevice {
         updateInterruptLine()
     }
 
-    /// The end of a frame: commands written since the last one take
-    /// effect.
+    /// The end of a frame. At most one queued command is latched: the
+    /// pipe retires a swap at vblank, and IOMobileFramebuffer waits on
+    /// that swap's ID before it reuses the surface. Applying every
+    /// command queued this frame would publish only the last ID, drop
+    /// the surfaces in between (the lock screen never gets a frame on
+    /// the way to the home screen), and leave any waiter that missed
+    /// that single completion asleep.
     func frameEnded() {
         var status = Self.vblank
-        for pending in pendingCommands {
+        if !pendingCommands.isEmpty {
+            let pending = pendingCommands.removeFirst()
             apply(pending.words)
             registers[Int(Self.completedCommandID / 4)] = pending.id
             status |= Self.commandDone
         }
-        pendingCommands.removeAll()
         registers[Int(Self.interruptStatus / 4)] |= status
         updateInterruptLine()
     }

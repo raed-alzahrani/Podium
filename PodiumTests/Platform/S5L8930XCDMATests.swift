@@ -126,6 +126,61 @@ final class S5L8930XCDMATests: XCTestCase {
         XCTAssertEqual(lines[0x30 + Int(channel)], true)
     }
 
+    /// Audio DMA must not raise done inside the store that starts the
+    /// channel. The completion interrupt is what lets the work loop
+    /// resubmit; raising it there starves the main thread.
+    func testPacedPeripheralCompletionWaitsForTheSampleClock() throws {
+        try write([9, 8, 7, 6], at: 0x400)
+        try chain(at: 0x100, command: 0x103, buffer: 0x400, length: 4)
+        cdma.completionIsPaced = { $0 == 0x0450_0410 }
+        let channel: UInt32 = 3
+        cdma.writeRegister(0x0450_0410, at: channel << 12 | 0x8)
+        cdma.writeRegister(2, at: channel << 12 | 0x4)
+        cdma.writeRegister(0x100, at: channel << 12 | 0x14)
+        cdma.writeRegister(1 | (1 << 3), at: channel << 12)
+
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 0, "not done inside the start write")
+        XCTAssertNotEqual(lines[0x30 + Int(channel)], true)
+
+        cdma.advancePacedTransfers(byteCount: 2)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 0)
+
+        cdma.advancePacedTransfers(byteCount: 2)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 1 << 19)
+        XCTAssertEqual(lines[0x30 + Int(channel)], true)
+    }
+
+    /// The modeled FIFO takes bytes only as its budget allows, and the
+    /// start write itself does not pump a paced channel to completion.
+    func testPacedEndpointDoesNotDrainInsideTheStartWrite() throws {
+        final class Budget: DMAEndpoint {
+            var budget = 0
+            var received: [UInt8] = []
+            var dmaSpace: Int { budget }
+            func dmaPush(_ byte: UInt8) { budget -= 1; received.append(byte) }
+            var dmaAvailable: Int { 0 }
+            func dmaPop() -> UInt8 { 0 }
+        }
+        let endpoint = Budget()
+        cdma.attach(endpoint, dataRegister: 0x0450_0410)
+        cdma.completionIsPaced = { $0 == 0x0450_0410 }
+        try write([1, 2, 3, 4], at: 0x400)
+        try chain(at: 0x100, command: 0x103, buffer: 0x400, length: 4)
+        let channel: UInt32 = 4
+        cdma.writeRegister(0x0450_0410, at: channel << 12 | 0x8)
+        cdma.writeRegister(2, at: channel << 12 | 0x4)
+        cdma.writeRegister(0x100, at: channel << 12 | 0x14)
+        cdma.writeRegister(1 | (1 << 3), at: channel << 12)
+
+        XCTAssertTrue(endpoint.received.isEmpty)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 0)
+
+        endpoint.budget = 4
+        cdma.pumpPeripherals()
+        XCTAssertEqual(endpoint.received, [1, 2, 3, 4])
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 1 << 19)
+    }
+
     func testChannelEnableBitsReadBack() {
         cdma.writeRegister(0b110, at: 0x0)
         cdma.writeRegister(0b010, at: 0x8)

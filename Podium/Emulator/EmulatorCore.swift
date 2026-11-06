@@ -330,6 +330,18 @@ final class EmulatorCore {
 
     // MARK: Log
 
+    /// The on-disk log when it has anything in it (it keeps every line,
+    /// not just the last ones the screen shows), otherwise the lines
+    /// still in memory.
+    var fullLogText: String {
+        if let url = Self.logFileURL,
+           let text = try? String(contentsOf: url, encoding: .utf8) {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return log.map { "\($0.formattedTime) \($0.message)" }.joined(separator: "\n")
+    }
+
     private func appendLog(_ message: String) {
         let entry = EmulatorLogEntry(date: Date(), message: message)
         log.append(entry)

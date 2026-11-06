@@ -93,10 +93,19 @@ final class S5L8930XCDMA: MMIODevice {
     /// alias) a channel's DAR can name.
     private var endpoints: [UInt32: DMAEndpoint] = [:]
     /// A memory-to-peripheral transfer whose register has no endpoint.
-    /// The channel is completed in the same call either way: a driver
-    /// waiting on the done interrupt (an audio buffer, for one) must not
-    /// be left running with nothing to finish it.
+    /// The channel is completed in the same call unless
+    /// `completionIsPaced` says to wait for `advancePacedTransfers`: a
+    /// driver waiting on the done interrupt must not be left running with
+    /// nothing to finish it, and an audio buffer must not finish inside
+    /// the store that started it.
     var unmodeledPeripheralWrite: ((UInt32, [UInt8]) -> Void)?
+    /// When this returns true, that peripheral channel stays running
+    /// until `advancePacedTransfers` has counted its bytes out. Immediate
+    /// completion raises the done line before a high-priority audio work
+    /// loop can sleep, so the loop resubmits and the main guest thread
+    /// never runs.
+    var completionIsPaced: ((UInt32) -> Bool)?
+    private var pacedRemaining: [Int: Int] = [:]
     /// A running peripheral channel: its memory segments and progress.
     private struct PeripheralTransfer {
         let toPeripheral: Bool
@@ -168,6 +177,7 @@ final class S5L8930XCDMA: MMIODevice {
         if value & Self.csrAbort != 0 {
             csr &= ~(Self.csrStateMask | Self.csrStart | Self.csrAbort | Self.csrPause | Self.csrPaused)
             peripheralTransfers[channel] = nil
+            pacedRemaining[channel] = nil
         }
         if value & Self.csrStart != 0, old & Self.csrStateMask == 0 {
             csr = (csr & ~(Self.csrStateMask | Self.csrPause | Self.csrPaused)) | Self.csrStateRunning
@@ -183,11 +193,14 @@ final class S5L8930XCDMA: MMIODevice {
         let csr = register(channel, 0)
         guard csr & Self.csrMemoryToMemory != 0 else {
             let dataRegister = register(channel, 0x8) & 0x7FFF_FFFF
+            let paced = completionIsPaced?(dataRegister) ?? false
             guard let endpoint = endpoints[dataRegister] else {
                 let chain = walkChain(at: register(channel, 0x14))
+                let byteCount = chain.segments.reduce(0) { $0 + $1.length }
                 if register(channel, 0x4) & 2 != 0 {
                     let bus = memory()
                     var bytes: [UInt8] = []
+                    bytes.reserveCapacity(byteCount)
                     for segment in chain.segments {
                         if let chunk = try? bus.readBytes(segment.length, at: segment.address) {
                             bytes.append(contentsOf: chunk)
@@ -195,9 +208,13 @@ final class S5L8930XCDMA: MMIODevice {
                     }
                     unmodeledPeripheralWrite?(dataRegister, bytes)
                 }
-                log?(String(format: "cdma| channel %d: peripheral register %08x completed without a device (%d bytes)", channel, dataRegister, chain.segments.reduce(0) { $0 + $1.length }))
+                log?(String(format: "cdma| channel %d: peripheral register %08x %@ without a device (%d bytes)", channel, dataRegister, paced ? "paced" : "completed", byteCount))
                 setRegister(channel, 0x14, chain.end)
-                finish(channel)
+                if paced, byteCount > 0 {
+                    pacedRemaining[channel] = byteCount
+                } else {
+                    finish(channel)
+                }
                 return
             }
             // DCR bit 1: memory to peripheral (openiBoot's "out").
@@ -207,7 +224,10 @@ final class S5L8930XCDMA: MMIODevice {
             log?(String(format: "cdma| channel %d chain at %08x: %@ -> %08x", channel, register(channel, 0x14), chain.commands, chain.end))
             log?(String(format: "cdma| channel %d started: %@ %08x, dcr %08x, %d bytes", channel, register(channel, 0x4) & 2 != 0 ? "to" : "from",
                         dataRegister, register(channel, 0x4), peripheralTransfers[channel]!.segments.reduce(0) { $0 + $1.length }))
-            pumpPeripherals()
+            // Paced endpoints (the I²S FIFO) take their bytes from the
+            // frame tick. Pumping here would retire the buffer before the
+            // guest instruction that started it has finished.
+            if !paced { pumpPeripherals() }
             return
         }
         let source = channel & 1 == 1 ? channel : channel - 1
@@ -216,6 +236,25 @@ final class S5L8930XCDMA: MMIODevice {
         let running = { (c: Int) in self.register(c, 0) & Self.csrStateMask == Self.csrStateRunning }
         guard running(source), running(sink) else { return }
         transfer(from: source, to: sink)
+    }
+
+    /// Counts `byteCount` bytes off every peripheral channel whose
+    /// completion was deferred, and raises done for each one that reaches
+    /// the end. Audio calls this once per guest frame with one frame of
+    /// samples, so the work loop blocks between buffers instead of
+    /// resubmitting inside its own completion interrupt.
+    func advancePacedTransfers(byteCount: Int) {
+        guard byteCount > 0, !pacedRemaining.isEmpty else { return }
+        for channel in pacedRemaining.keys.sorted() {
+            let left = (pacedRemaining[channel] ?? 0) - byteCount
+            if left <= 0 {
+                pacedRemaining[channel] = nil
+                finish(channel)
+                log?(String(format: "cdma| channel %d: paced peripheral completion", channel))
+            } else {
+                pacedRemaining[channel] = left
+            }
+        }
     }
 
     /// Moves bytes between running peripheral channels and their

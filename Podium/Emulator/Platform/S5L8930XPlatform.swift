@@ -120,6 +120,10 @@ final class S5L8930XPlatform: DeviceEventHandler {
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.transmitData)
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.receiveData)
         cdma.attach(i2s0, dataRegister: Self.i2s0Base + S5L8930XI2S.transmitData)
+        cdma.completionIsPaced = { address in
+            let base = address & ~Self.aliasBit
+            return base >= Self.i2s0Base && base < Self.i2s0Base + S5L8930XI2S.windowLength
+        }
         cdma.unmodeledPeripheralWrite = { [unowned self] address, bytes in
             let base = address & ~Self.aliasBit
             guard base >= Self.i2s0Base, base < Self.i2s0Base + S5L8930XI2S.windowLength else { return }
@@ -200,6 +204,15 @@ final class S5L8930XPlatform: DeviceEventHandler {
         let tick = virtualTime / Self.instructionsPerTimebaseTick
         timer.advance(toTick: tick)
         if tick >= nextFrameTick {
+            // One frame of guest audio, then the pipes' vblank. The DMA
+            // done line is raised here, after the store that queued the
+            // buffer has returned, so the audio work loop can sleep and
+            // the main thread can run the unlock animation between
+            // buffers. At most one display-pipe command retires on this
+            // vblank (see `S5L8930XDisplayPipe.frameEnded`).
+            i2s0.refillTransmitBudget()
+            cdma.pumpPeripherals()
+            cdma.advancePacedTransfers(byteCount: S5L8930XI2S.bytesPerFrame)
             displayPipe.frameEnded()
             clcd.frameEnded()
             i2s0.flush()
