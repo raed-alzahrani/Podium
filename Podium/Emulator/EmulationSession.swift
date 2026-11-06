@@ -21,11 +21,32 @@ final class EmulationSession {
         case halted(String)
     }
 
+    /// Registers and translator counters copied on the emulation thread,
+    /// after a run slice. The UI reads this instead of the live CPU.
+    struct CPUSample: Equatable {
+        var registers: [UInt32]
+        var cpsr: UInt32
+        var lastError: CPUError?
+        var blocksTranslated: Int
+        var guestInstructionsTranslated: Int
+        var entries: Int
+        var deopts: Int
+        var notTranslatedARM: Int
+        var notTranslatedThumb: Int
+        var interpretedInPlace: Int
+        var dbtAttached: Bool
+
+        static let empty = CPUSample(registers: [UInt32](repeating: 0, count: 16), cpsr: 0, lastError: nil,
+                                     blocksTranslated: 0, guestInstructionsTranslated: 0, entries: 0, deopts: 0,
+                                     notTranslatedARM: 0, notTranslatedThumb: 0, interpretedInPlace: 0, dbtAttached: false)
+    }
+
     struct Snapshot {
         let state: State
         let retiredInstructions: UInt64
         let virtualTime: UInt64
         let jitAvailable: Bool
+        let cpuSample: CPUSample
     }
 
     struct StopResult {
@@ -132,6 +153,7 @@ final class EmulationSession {
         // iOS, once a debugger such as StikDebug has prepared memory for
         // it); the interpreter otherwise.
         cpu.dbt = DBTEngine(cpu: cpu)
+        cpuSample = captureCPUSample()
         KernelAcceleration.install(on: cpu)
         // A reset by any other route (the kernel ends a halt with the
         // watchdog, and spins until it lands) ends the run too; the run
@@ -290,7 +312,8 @@ final class EmulationSession {
     func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
-        return Snapshot(state: state, retiredInstructions: retired, virtualTime: virtualTime, jitAvailable: cpu.dbt != nil)
+        return Snapshot(state: state, retiredInstructions: retired, virtualTime: virtualTime,
+                        jitAvailable: cpuSample.dbtAttached, cpuSample: cpuSample)
     }
 
     // MARK: Buttons
@@ -408,6 +431,7 @@ final class EmulationSession {
             lock.lock()
             retired = cpu.retiredInstructionCount
             virtualTime = cpu.virtualTime
+            cpuSample = captureCPUSample()
             lock.unlock()
         }
         let stateBeforeFlush = finalState
@@ -426,6 +450,9 @@ final class EmulationSession {
         }
         lock.lock()
         state = finalState
+        retired = cpu.retiredInstructionCount
+        virtualTime = cpu.virtualTime
+        cpuSample = captureCPUSample()
         runLoopHasFinished = true
         lock.unlock()
         runLoopFinished.leave()
@@ -464,6 +491,23 @@ final class EmulationSession {
             : Array(raw[buffer.start + last..<buffer.start + buffer.size]) + Array(raw[buffer.start..<buffer.start + buffer.next])
         return String(decoding: bytes.filter { $0 != 0 }, as: UTF8.self)
     }
+
+    /// Guest registers and translator counters. Only the emulation thread
+    /// (or `init`, before that thread exists) may call this.
+    private func captureCPUSample() -> CPUSample {
+        var registers = [UInt32](repeating: 0, count: 16)
+        for index in 0..<16 { registers[index] = cpu.registers[index] }
+        let stats = cpu.dbt?.statistics
+        return CPUSample(registers: registers, cpsr: cpu.cpsr.rawValue, lastError: cpu.lastError,
+                         blocksTranslated: stats?.blocksTranslated ?? 0,
+                         guestInstructionsTranslated: stats?.guestInstructionsTranslated ?? 0,
+                         entries: stats?.entries ?? 0, deopts: stats?.deopts ?? 0,
+                         notTranslatedARM: stats?.notTranslatedARM ?? 0, notTranslatedThumb: stats?.notTranslatedThumb ?? 0,
+                         interpretedInPlace: stats?.interpretedInPlace ?? 0, dbtAttached: cpu.dbt != nil)
+    }
+
+    /// Registers and translator counters from the last finished run slice.
+    private var cpuSample = CPUSample.empty
 
     private func readCString(atKernelVirtual address: UInt32) -> String {
         var bytes: [UInt8] = []

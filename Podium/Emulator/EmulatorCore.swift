@@ -30,6 +30,8 @@ final class EmulatorCore {
     /// Guest instructions per second over the last few seconds.
     private(set) var instructionsPerSecond: Double = 0
     private(set) var jitAvailable = false
+    /// Registers and translator counters from the last finished run slice.
+    private(set) var cpuSample: EmulationSession.CPUSample?
     /// What JIT allocation is doing, shown under "Loading the kernel…".
     private(set) var jitStatus = ""
     /// Set when StikDebug left a breakpoint stopped and allocation gave up.
@@ -164,6 +166,9 @@ final class EmulatorCore {
             rateSamples = [(Date(), 0)]
             bootStage = .booting(fraction: 0, secondsRemaining: nil)
             session.start()
+            let initial = session.snapshot()
+            jitAvailable = initial.jitAvailable
+            cpuSample = initial.cpuSample
             appendLog("Kernel loaded; iOS is starting.")
             startPolling()
         } catch let error as FriendlyError {
@@ -188,6 +193,7 @@ final class EmulatorCore {
         pollTask?.cancel()
         pollTask = nil
         self.session = nil
+        cpuSample = nil
         framebufferSource = nil
         bootStage = nil
         status = .stopped
@@ -222,6 +228,7 @@ final class EmulatorCore {
         guard let session else { return }
         let snapshot = session.snapshot()
         jitAvailable = snapshot.jitAvailable
+        cpuSample = snapshot.cpuSample
         let now = Date()
         rateSamples.append((now, snapshot.retiredInstructions))
         rateSamples.removeAll { now.timeIntervalSince($0.time) > 6 }
@@ -272,6 +279,7 @@ final class EmulatorCore {
             return
         }
         session = nil
+        cpuSample = nil
         switch state {
         case .panicked(let message):
             status = .error("iOS panicked: \(message)")

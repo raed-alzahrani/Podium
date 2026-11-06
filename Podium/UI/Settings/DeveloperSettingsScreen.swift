@@ -2,28 +2,30 @@ import SwiftUI
 import UIKit
 
 /// Secondary, hidden-by-default screen (Section 13 of the project spec).
-/// Everything here is either a real static fact, the CPU's actual live
-/// state once activated, or Podium's real activity log — never sample or
-/// placeholder data. Downcasting `emulatorCore.cpu` to `ARMv7CPU` is
-/// intentional and confined to this one debug-only screen — everywhere
-/// else in the app depends only on the `CPU` protocol.
+/// Everything here is either a real static fact, a copy of CPU state taken
+/// on the emulation thread, or Podium's real activity log — never sample or
+/// placeholder data. The screen does not read the live CPU: that object is
+/// owned by the emulation thread.
 struct DeveloperSettingsScreen: View {
     @Environment(EmulatorCore.self) private var emulatorCore
     @State private var stikDebugUnavailable = false
 
-    private var armCPU: ARMv7CPU? {
-        emulatorCore.cpu as? ARMv7CPU
+    /// True once the session attached `DBTEngine`, which only happens after
+    /// the JIT region is mapped.
+    private var jitActive: Bool {
+        emulatorCore.jitAvailable || emulatorCore.cpuSample?.dbtAttached == true
     }
 
     var body: some View {
         List {
             Section("CPU") {
                 LabeledContent("Target Architecture", value: "ARMv7 (Apple A4)")
-                if let armCPU {
-                    LabeledContent("Status", value: "Interpreter active")
-                    LabeledContent("PC", value: hex(armCPU.registers.pc))
-                    LabeledContent("CPSR Flags", value: cpsrSummary(armCPU.cpsr))
-                    if let error = armCPU.lastError {
+                if let sample = emulatorCore.cpuSample {
+                    LabeledContent("Status", value: sample.dbtAttached ? "DBT" : "Interpreter")
+                    LabeledContent("Speed", value: speedText)
+                    LabeledContent("PC", value: hex(sample.registers[Registers.pcIndex]))
+                    LabeledContent("CPSR Flags", value: cpsrSummary(CPSR(rawValue: sample.cpsr)))
+                    if let error = sample.lastError {
                         LabeledContent("Halted", value: describe(error))
                             .foregroundStyle(.red)
                     }
@@ -32,10 +34,10 @@ struct DeveloperSettingsScreen: View {
                 }
             }
 
-            if let armCPU {
+            if let sample = emulatorCore.cpuSample {
                 Section("Registers") {
                     ForEach(0..<16, id: \.self) { index in
-                        LabeledContent(registerName(index), value: hex(armCPU.registers[index]))
+                        LabeledContent(registerName(index), value: hex(sample.registers[index]))
                             .font(.system(.body, design: .monospaced))
                     }
                 }
@@ -45,18 +47,25 @@ struct DeveloperSettingsScreen: View {
                 Button("Turn on JIT") {
                     openStikDebug()
                 }
-                if let jit = armCPU?.jit {
-                    LabeledContent("Available", value: jit.isAvailable ? "Yes" : "No — interpreting only")
-                    LabeledContent("Compiled Blocks", value: "\(jit.stats.compiledBlockCount)")
-                    LabeledContent("Cache Hits", value: "\(jit.stats.cacheHitCount)")
-                    LabeledContent("Interpreter Fallbacks", value: "\(jit.stats.interpreterFallbackCount)")
-                } else {
-                    LabeledContent("Status", value: "Not active")
+                LabeledContent("Status", value: jitActive ? "Active" : "Not active")
+                if !emulatorCore.jitStatus.isEmpty {
+                    Text(emulatorCore.jitStatus)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let sample = emulatorCore.cpuSample, sample.dbtAttached {
+                    LabeledContent("Engine", value: "DBT")
+                    LabeledContent("Blocks translated", value: sample.blocksTranslated.formatted())
+                    LabeledContent("Entries", value: sample.entries.formatted())
+                    LabeledContent("Guest instructions translated", value: sample.guestInstructionsTranslated.formatted())
+                    LabeledContent("Deopts", value: sample.deopts.formatted())
+                    LabeledContent("Interpreted inside a block", value: sample.interpretedInPlace.formatted())
+                    LabeledContent("Not translated", value: "ARM \(sample.notTranslatedARM.formatted()), Thumb \(sample.notTranslatedThumb.formatted())")
                 }
             } header: {
                 Text("JIT")
             } footer: {
-                Text("On iOS, native code execution normally requires a debugger-granted right this app doesn't request by default — \"No\" here usually means that, not a bug.")
+                Text("Translated execution is DBTEngine, attached when the JIT region exists. Counters refresh about twice a second from the emulation thread. A high “Interpreted inside a block” count means translated code is still handing instructions back to the interpreter.")
             }
 
             Section("Memory") {
@@ -112,6 +121,12 @@ struct DeveloperSettingsScreen: View {
                 }
             }
         }
+    }
+
+    private var speedText: String {
+        let rate = emulatorCore.instructionsPerSecond
+        guard rate > 0 else { return "—" }
+        return String(format: "%.1f M/s", rate / 1_000_000)
     }
 
     private func hex(_ value: UInt32) -> String {
