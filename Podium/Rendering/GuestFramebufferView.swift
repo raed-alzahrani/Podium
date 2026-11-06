@@ -9,16 +9,21 @@ import UIKit
 /// Each frame is copied straight from guest memory into one of three
 /// shared-storage Metal buffers — each the backing store of a texture —
 /// and drawn as a full-screen triangle, so the only CPU work per frame is
-/// that one copy. Touches pass through to the SwiftUI gesture around it.
+/// that one copy. Touches land on this view and are reported as guest
+/// digitizer events.
 struct GuestFramebufferView: UIViewRepresentable {
     let source: FramebufferSource
+    var onTouch: (InputEvent) -> Void
 
     func makeUIView(context: Context) -> FramebufferMetalView {
-        FramebufferMetalView(source: source)
+        let view = FramebufferMetalView(source: source)
+        view.onTouch = onTouch
+        return view
     }
 
     func updateUIView(_ view: FramebufferMetalView, context: Context) {
         view.source = source
+        view.onTouch = onTouch
     }
 
     static func dismantleUIView(_ view: FramebufferMetalView, coordinator: ()) {
@@ -28,6 +33,7 @@ struct GuestFramebufferView: UIViewRepresentable {
 
 final class FramebufferMetalView: UIView {
     var source: FramebufferSource
+    var onTouch: ((InputEvent) -> Void)?
 
     override class var layerClass: AnyClass { CAMetalLayer.self }
     private var metalLayer: CAMetalLayer { layer as! CAMetalLayer }
@@ -78,7 +84,11 @@ final class FramebufferMetalView: UIView {
             return device.makeSamplerState(descriptor: descriptor)
         }
         super.init(frame: .zero)
-        isUserInteractionEnabled = false
+        // This view is the hit target. Leaving interaction off made the
+        // SwiftUI drag gesture miss the screen entirely, so the lock
+        // screen never saw a finger.
+        isUserInteractionEnabled = true
+        isMultipleTouchEnabled = false
         backgroundColor = .black
         metalLayer.device = device
         metalLayer.pixelFormat = .bgra8Unorm
@@ -109,6 +119,38 @@ final class FramebufferMetalView: UIView {
         } else {
             stop()
         }
+    }
+
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        onTouch?(.touchBegan(devicePoint(touch)))
+    }
+
+    override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        onTouch?(.touchMoved(devicePoint(touch)))
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        onTouch?(.touchEnded(devicePoint(touch)))
+    }
+
+    override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let touch = touches.first else { return }
+        onTouch?(.touchEnded(devicePoint(touch)))
+    }
+
+    /// A point in this view, in the guest's 640×960 framebuffer pixels.
+    /// The view is laid out at the panel's 2:3 aspect, so the fraction
+    /// across it is the fraction across the panel.
+    private func devicePoint(_ touch: UITouch) -> TouchPoint {
+        let bounds = self.bounds
+        guard bounds.width > 0, bounds.height > 0 else { return TouchPoint(x: 0, y: 0, touchID: 0) }
+        let location = touch.location(in: self)
+        let x = min(max(location.x / bounds.width, 0), 1) * Double(GuestMemoryLayout.framebufferWidth)
+        let y = min(max(location.y / bounds.height, 0), 1) * Double(GuestMemoryLayout.framebufferHeight)
+        return TouchPoint(x: x, y: y, touchID: 0)
     }
 
     override func layoutSubviews() {

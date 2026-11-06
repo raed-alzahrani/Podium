@@ -70,7 +70,7 @@ final class EmulatorCore {
     private var rateSamples: [(time: Date, retired: UInt64)] = []
 
     init(
-        audioOutput: AudioOutput = NullAudioOutput(),
+        audioOutput: AudioOutput = HostAudioOutput(),
         networkInterface: NetworkInterface = NullNetworkInterface(),
         inputController: InputController = PassthroughInputController(),
         persistentGuestStorage: PersistentGuestStorage? = nil
@@ -129,11 +129,13 @@ final class EmulatorCore {
             bootStage = .loadingKernel
             jitStatus = "Loading the kernel…"
             jitAlert = nil
+            audioOutput.prepareLockSound(rootFilesystem: RootFilesystemPreparer.imageURL(forFirmwareAt: fileURL))
             let userImage = try persistentGuestStorage.prepareUserVolume(forFirmwareAt: fileURL)
             if userImage.fromOlderRecipe {
                 appendLog("This iOS install was made by an older Podium; erase it in Settings to pick up the newer system image.")
             }
             let rootFilesystem = userImage.url
+            let output = audioOutput
             let statusPoll = Task { @MainActor [weak self] in
                 while !Task.isCancelled {
                     let text = String(cString: podium_jit_status())
@@ -145,7 +147,7 @@ final class EmulatorCore {
             let session = try await Task.detached(priority: .userInitiated) {
                 let kernel = try KernelcacheExtractor.extractKernelMachO(from: firmware, storedAt: fileURL)
                 let deviceTree = try DeviceTreeExtractor.extractDeviceTree(from: firmware, storedAt: fileURL)
-                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true)
+                return try EmulationSession(kernel: kernel, deviceTree: deviceTree, rootFilesystem: rootFilesystem, persistent: true, audioOutput: output)
             }.value
             let jitReport = String(cString: podium_jit_status())
             if !jitReport.isEmpty {
@@ -208,6 +210,9 @@ final class EmulatorCore {
     }
 
     func sendInput(_ event: InputEvent) {
+        if case .powerButton(pressed: true) = event, !audioOutput.guestAudioIsAudible {
+            audioOutput.playLockSound()
+        }
         inputController.send(event)
         session?.send(event)
     }

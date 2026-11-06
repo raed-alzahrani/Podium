@@ -77,7 +77,10 @@ final class DBTEngine {
     /// virtual address with the Thumb bit (word 0), the physical page
     /// with bit 0 set (word 1), and the code's address (bytes 8...15).
     let table: UnsafeMutableRawPointer
-    static let tableEntries = 1 << 16
+    /// 1,048,576 slots, 16 MB. A 64 MB code region holds far more blocks
+    /// than 65,536 slots can name, and every return looks this table up,
+    /// so the smaller table thrashed on a game's working set.
+    static let tableEntries = 1 << 20
 
     // MARK: Code region layout
 

@@ -119,6 +119,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
         spi1.slave = touch
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.transmitData)
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.receiveData)
+        cdma.attach(i2s0, dataRegister: Self.i2s0Base + S5L8930XI2S.transmitData)
         spi1.dmaRequest = { [unowned self] in self.cdma.pumpPeripherals() }
         touch.setAttention = { [unowned self] asserted in
             self.gpio.setInputLevel(!asserted, pin: S5L8930XGPIO.Pin.touchInterrupt)
@@ -193,6 +194,7 @@ final class S5L8930XPlatform: DeviceEventHandler {
         if tick >= nextFrameTick {
             displayPipe.frameEnded()
             clcd.frameEnded()
+            i2s0.flush()
             touch.scan(time: milliseconds)
             nextFrameTick = (tick / Self.frameTicks + 1) * Self.frameTicks
         }

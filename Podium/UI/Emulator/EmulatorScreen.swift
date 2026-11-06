@@ -3,7 +3,6 @@ import SwiftUI
 struct EmulatorScreen: View {
     @Environment(FirmwareLibrary.self) private var firmwareLibrary
     @Environment(EmulatorCore.self) private var emulatorCore
-    @State private var touchActive = false
 
     private var firmware: ImportedFirmware? {
         firmwareLibrary.activeFirmware
@@ -14,7 +13,9 @@ struct EmulatorScreen: View {
     @ViewBuilder
     private var screen: some View {
         if emulatorCore.bootStage == .running, let source = emulatorCore.framebufferSource {
-            GuestFramebufferView(source: source)
+            GuestFramebufferView(source: source) { event in
+                emulatorCore.sendInput(event)
+            }
         } else {
             BootProgressView(stage: emulatorCore.bootStage, instructionsPerSecond: emulatorCore.instructionsPerSecond, kernelDetail: emulatorCore.jitStatus)
         }
@@ -32,8 +33,6 @@ struct EmulatorScreen: View {
                     screen
                         .frame(width: displayWidth, height: displayHeight)
                         .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
-                        .contentShape(Rectangle())
-                        .gesture(touchGesture(in: CGSize(width: displayWidth, height: displayHeight)))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
                 .frame(maxHeight: min(geometry.size.height * 0.68, 610))
@@ -140,34 +139,6 @@ struct EmulatorScreen: View {
         }
     }
 
-    /// One finger on the virtual touchscreen: down, moves, up.
-    private func touchGesture(in size: CGSize) -> some Gesture {
-        DragGesture(minimumDistance: 0)
-            .onChanged { value in
-                let point = devicePoint(from: value.location, in: size)
-                if touchActive {
-                    emulatorCore.sendInput(.touchMoved(point))
-                } else {
-                    touchActive = true
-                    emulatorCore.sendInput(.touchBegan(point))
-                }
-            }
-            .onEnded { value in
-                touchActive = false
-                emulatorCore.sendInput(.touchEnded(devicePoint(from: value.location, in: size)))
-            }
-    }
-
-    /// Maps a location in the displayed screen to the device's own
-    /// 640×960 pixel coordinates.
-    private func devicePoint(from location: CGPoint, in size: CGSize) -> TouchPoint {
-        guard size.width > 0, size.height > 0 else {
-            return TouchPoint(x: 0, y: 0, touchID: 0)
-        }
-        let x = min(max(location.x / size.width, 0), 1) * 640
-        let y = min(max(location.y / size.height, 0), 1) * 960
-        return TouchPoint(x: x, y: y, touchID: 0)
-    }
 }
 
 #Preview {

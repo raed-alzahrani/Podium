@@ -115,7 +115,7 @@ final class EmulationSession {
 
     /// `persistent`: the guest's writes to its root filesystem go to the
     /// image file, and last; otherwise every boot starts from the image.
-    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false) throws {
+    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false, audioOutput: AudioOutput? = nil) throws {
         ram = FlatPhysicalMemory(length: GuestMemoryLayout.ramSize, baseAddress: GuestMemoryLayout.ramPhysicalBase)
         persistentRootFilesystem = persistent
         // A small on-chip SRAM at low physical addresses, separate from
@@ -131,6 +131,7 @@ final class EmulationSession {
         // Devices with real behavior go on the bus before the plain
         // storage KernelBootstrap adds for the other peripheral windows.
         platform = S5L8930XPlatform(cpu: cpu)
+        platform.i2s0.output = audioOutput
         for region in platform.regions { bus.addRegion(region) }
         display = DisplayScanout(memory: bus, dart: platform.dart2, bootFramebuffer: GuestFramebuffer(
             memory: ram,
