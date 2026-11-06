@@ -126,6 +126,7 @@ final class S5L8930XCDMATests: XCTestCase {
         XCTAssertEqual(lines[0x30 + Int(channel)], true)
         XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404, "MAR is MA + BC once the buffer has been taken")
         XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 0, "DBR is 0 in the same update as done")
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x14), 0x120, "CAR rests past the command so the kernel can retire it")
     }
 
     /// Audio DMA must not raise done inside the store that starts the
@@ -156,6 +157,7 @@ final class S5L8930XCDMATests: XCTestCase {
         XCTAssertEqual(lines[0x30 + Int(channel)], true)
         XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404, "MAR == MA + BC when done is raised")
         XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 0)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x14), 0x120, "CAR advances past the buffer when the channel finishes")
     }
 
     /// Stopping a channel mid-buffer must report the bytes actually taken.
@@ -226,6 +228,32 @@ final class S5L8930XCDMATests: XCTestCase {
         XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 1 << 19)
         XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404)
         XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 0)
+    }
+
+    /// A stopped I²S clock means this is a boot probe, not playback. The
+    /// command has to retire in the start write, with CAR past the buffer.
+    func testIdleAudioProbeCompletesWithoutWaitingForTheSampleClock() throws {
+        try write([1, 2, 3, 4], at: 0x400)
+        try chain(at: 0x100, command: 0x103, buffer: 0x400, length: 4)
+        var reported: [UInt8] = []
+        cdma.unmodeledPeripheralWrite = { reported.append(contentsOf: $1) }
+        cdma.isAudioRegister = { $0 == 0x0450_0410 }
+        cdma.completionIsPaced = { _ in false }
+        let channel: UInt32 = 6
+        cdma.writeRegister(0x0450_0410, at: channel << 12 | 0x8)
+        cdma.writeRegister(2, at: channel << 12 | 0x4)
+        cdma.writeRegister(0x100, at: channel << 12 | 0x14)
+        cdma.writeRegister(1 | (1 << 3), at: channel << 12)
+
+        XCTAssertEqual(reported, [1, 2, 3, 4])
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 1 << 19)
+        XCTAssertEqual(lines[0x30 + Int(channel)], true)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x14), 0x120)
+
+        cdma.writeRegister(1 << 19, at: channel << 12)
+        XCTAssertEqual(lines[0x30 + Int(channel)], false, "writing the done bit clears the interrupt")
+        XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 0)
     }
 
     func testChannelEnableBitsReadBack() {

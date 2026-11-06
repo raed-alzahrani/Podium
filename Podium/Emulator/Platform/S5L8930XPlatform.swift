@@ -120,9 +120,18 @@ final class S5L8930XPlatform: DeviceEventHandler {
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.transmitData)
         cdma.attach(spi1, dataRegister: Self.spi1Base + S5L8930XSPI.receiveData)
         cdma.attach(i2s0, dataRegister: Self.i2s0Base + S5L8930XI2S.transmitData)
-        cdma.completionIsPaced = { address in
+        cdma.isAudioRegister = { address in
             let base = address & ~Self.aliasBit
             return base >= Self.i2s0Base && base < Self.i2s0Base + S5L8930XI2S.windowLength
+        }
+        cdma.completionIsPaced = { [unowned self] address in
+            let base = address & ~Self.aliasBit
+            guard base >= Self.i2s0Base, base < Self.i2s0Base + S5L8930XI2S.windowLength else { return false }
+            // The kernel programs the FIFO before it enables the clock,
+            // including empty probes during logo bring-up. Those must
+            // complete in the start write. Real playback is paced only
+            // once the interface is actually transmitting.
+            return self.i2s0.isTransmitting
         }
         cdma.unmodeledPeripheralWrite = { [unowned self] address, bytes in
             let base = address & ~Self.aliasBit

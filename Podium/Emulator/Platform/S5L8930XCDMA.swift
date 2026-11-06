@@ -99,11 +99,15 @@ final class S5L8930XCDMA: MMIODevice {
     /// nothing to finish it, and an audio buffer must not finish inside
     /// the store that started it.
     var unmodeledPeripheralWrite: ((UInt32, [UInt8]) -> Void)?
+    /// When this returns true, the register is the I²S window. Probes of
+    /// that window complete in the start write; only a transmitting
+    /// interface is paced (`completionIsPaced`).
+    var isAudioRegister: ((UInt32) -> Bool)?
     /// When this returns true, that peripheral channel stays running
     /// until `advancePacedTransfers` has counted its bytes out. Immediate
     /// completion raises the done line before a high-priority audio work
     /// loop can sleep, so the loop resubmits and the main guest thread
-    /// never runs.
+    /// never runs. False during boot, while the interface is idle.
     var completionIsPaced: ((UInt32) -> Bool)?
     /// A running peripheral channel: its memory segments and progress.
     private struct PeripheralTransfer {
@@ -209,20 +213,34 @@ final class S5L8930XCDMA: MMIODevice {
         let csr = register(channel, 0)
         guard csr & Self.csrMemoryToMemory != 0 else {
             let dataRegister = register(channel, 0x8) & 0x7FFF_FFFF
-            let paced = completionIsPaced?(dataRegister) ?? false
+            let audio = isAudioRegister?(dataRegister) ?? false
+            // Tests set only `completionIsPaced`. The platform sets both,
+            // and pacing applies only while that register's clock is running.
+            let paced = isAudioRegister == nil
+                ? (completionIsPaced?(dataRegister) ?? false)
+                : audio && (completionIsPaced?(dataRegister) ?? false)
             // DCR bit 1 is memory-to-peripheral. Playback to a paced
             // target (the I²S FIFO) is that direction even when the bit
             // the driver wrote isn't the one openiBoot uses; otherwise
             // the PCM stays in guest memory, MAR never leaves MA, and
             // the stop check panics.
             let memoryToPeripheral = register(channel, 0x4) & 2 != 0 || paced
+            let chain = walkChain(at: register(channel, 0x14))
+            // Empty commands, and any I²S program while the clock is
+            // stopped, are probes. Finish them here. A paced playback
+            // buffer is the only transfer allowed to wait for the sample
+            // clock.
+            if chain.segments.isEmpty || (audio && !paced) {
+                if memoryToPeripheral || audio { deliverUnmodeled(chain, to: dataRegister) }
+                log?(String(format: "cdma| channel %d: peripheral register %08x completed (%d bytes)", channel, dataRegister, chain.segments.reduce(0) { $0 + $1.length }))
+                finishConsumed(channel, chain)
+                return
+            }
             guard let endpoint = endpoints[dataRegister] else {
-                let chain = walkChain(at: register(channel, 0x14))
-                let byteCount = chain.segments.reduce(0) { $0 + $1.length }
-                log?(String(format: "cdma| channel %d: peripheral register %08x %@ without a device (%d bytes)", channel, dataRegister, paced ? "paced" : "completed", byteCount))
-                if paced, let first = chain.segments.first {
+                if paced {
+                    log?(String(format: "cdma| channel %d: peripheral register %08x paced without a device (%d bytes)", channel, dataRegister, chain.segments.reduce(0) { $0 + $1.length }))
                     pacedTransfers[channel] = PacedTransfer(dataRegister: dataRegister, segments: chain.segments, end: chain.end)
-                    publish(channel, first, consumed: 0)
+                    publish(channel, chain.segments[0], consumed: 0)
                 } else if memoryToPeripheral {
                     deliverUnmodeled(chain, to: dataRegister)
                     finishConsumed(channel, chain)
@@ -232,16 +250,16 @@ final class S5L8930XCDMA: MMIODevice {
                 }
                 return
             }
-            let chain = walkChain(at: register(channel, 0x14))
             peripheralTransfers[channel] = PeripheralTransfer(toPeripheral: memoryToPeripheral, endpoint: endpoint,
                                                               segments: chain.segments, end: chain.end)
-            if let first = chain.segments.first { publish(channel, first, consumed: 0) }
+            if paced {
+                publish(channel, chain.segments[0], consumed: 0)
+            }
             log?(String(format: "cdma| channel %d chain at %08x: %@ -> %08x", channel, register(channel, 0x14), chain.commands, chain.end))
-            log?(String(format: "cdma| channel %d started: %@ %08x, dcr %08x, %d bytes", channel, register(channel, 0x4) & 2 != 0 ? "to" : "from",
+            log?(String(format: "cdma| channel %d started: %@ %08x, dcr %08x, %d bytes", channel, memoryToPeripheral ? "to" : "from",
                         dataRegister, register(channel, 0x4), peripheralTransfers[channel]!.segments.reduce(0) { $0 + $1.length }))
-            // Paced endpoints (the I²S FIFO) take their bytes from the
-            // frame tick. Pumping here would retire the buffer before the
-            // guest instruction that started it has finished.
+            // Paced playback waits for the frame tick. Everything else
+            // (the touchscreen FIFO included) runs in this write.
             if !paced { pumpPeripherals() }
             return
         }
@@ -337,9 +355,15 @@ final class S5L8930XCDMA: MMIODevice {
 
     private func finish(_ channel: Int) {
         let csr = register(channel, 0)
+        let alreadyDone = csr & Self.csrDone != 0
         setRegister(channel, 0xC, 0)
         setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
-        if csr & Self.csrInterruptEnable != 0 { setInterruptLine(Self.firstInterruptLine + channel, true) }
+        // Rising edge only. A level that stays high after the guest has
+        // written the done bit back is an interrupt storm, and boot never
+        // leaves the Apple logo.
+        if !alreadyDone, csr & Self.csrInterruptEnable != 0 {
+            setInterruptLine(Self.firstInterruptLine + channel, true)
+        }
     }
 
     /// MAR, DBR and CAR for one position in `segment`. Consumed bytes
@@ -372,19 +396,18 @@ final class S5L8930XCDMA: MMIODevice {
         if !bytes.isEmpty { unmodeledPeripheralWrite?(dataRegister, bytes) }
     }
 
-    /// The channel has taken every byte of its chain. MAR is the last
-    /// data segment's MA + BC and DBR is 0, in the same update that raises
-    /// done. CAR stays on that segment: the stop check reads MA and BC
-    /// from the command CAR points at, and a terminator past it has
-    /// neither.
+    /// The channel has taken every byte of its chain. CAR moves to the
+    /// descriptor after the last data segment — the kernel treats
+    /// everything before CAR as done, and leaving it on the buffer makes
+    /// the completion handler submit that buffer again forever. MAR is
+    /// that segment's MA + BC and DBR is 0 in the same update that raises
+    /// done, so a later stop still sees one terminal position.
     private func finishConsumed(_ channel: Int, _ chain: (segments: [Segment], end: UInt32, commands: String)) {
         if let last = chain.segments.last {
             setRegister(channel, 0x10, last.address &+ UInt32(last.length))
-            setRegister(channel, 0xC, 0)
-            setRegister(channel, 0x14, last.descriptor)
-        } else {
-            setRegister(channel, 0x14, chain.end)
         }
+        setRegister(channel, 0xC, 0)
+        setRegister(channel, 0x14, chain.end)
         finish(channel)
     }
 
@@ -470,10 +493,7 @@ final class S5L8930XCDMA: MMIODevice {
             if chain.segments.count == 1, let only = chain.segments.first {
                 setRegister(channel, 0x10, only.address &+ UInt32(only.length))
             }
-            let csr = register(channel, 0)
-            setRegister(channel, 0xC, 0)
-            setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
-            if csr & Self.csrInterruptEnable != 0 { setInterruptLine(Self.firstInterruptLine + channel, true) }
+            finish(channel)
         }
     }
 

@@ -24,7 +24,6 @@ final class HostAudioOutput: AudioOutput {
     private var ring: [Float]
     private var readIndex = 0
     private var available = 0
-    private var receivedGuestAudio = false
     private var lockSound: [Float]
     private var preparedRoot: URL?
 
@@ -41,17 +40,16 @@ final class HostAudioOutput: AudioOutput {
         startEngine()
     }
 
-    var guestAudioIsAudible: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return receivedGuestAudio
-    }
+    private var audible = false
+
+    var guestAudioIsAudible: Bool { audible }
 
     func enqueue(samples: [Float]) {
         guard !samples.isEmpty else { return }
-        lock.lock()
-        receivedGuestAudio = true
-        lock.unlock()
+        // The emulation thread must not take `lock` or call into
+        // AVAudioSession. Both can wait on the render callback, and a
+        // wait there freezes the guest on the Apple logo.
+        audible = true
         let copy = samples
         enqueueQueue.async { [weak self] in
             guard let self else { return }

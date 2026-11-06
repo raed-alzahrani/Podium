@@ -114,6 +114,10 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
         accept(UInt8(truncatingIfNeeded: value >> 8))
     }
 
+    /// True while control bit 0 is set. Boot probes the FIFO before this
+    /// comes up; DMA aimed here then has to finish without the sample clock.
+    var isTransmitting: Bool { transmitting }
+
     private var transmitting: Bool { registers[0] & Self.controlActive != 0 }
 
     private func accept(_ byte: UInt8) {
