@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import os
 
 /// Plays guest PCM, and the lock click, through `AVAudioEngine`.
 ///
@@ -21,6 +22,7 @@ final class HostAudioOutput: AudioOutput {
     }
 
     private let engine = AVAudioEngine()
+    private var source: AVAudioSourceNode?
     private let format: AVAudioFormat
     private let lock = NSLock()
     private let scheduleLock = NSLock()
@@ -36,6 +38,11 @@ final class HostAudioOutput: AudioOutput {
     private var needsSessionRestart = true
     private var playbackLive = false
     private var playbackScheduled = false
+    private var loggedRender = false
+    private var loggedSessionFailure = false
+    /// One line when the session comes up, when it fails, and the first
+    /// time the render callback actually pulls the ring.
+    var onDiagnostic: ((String) -> Void)?
 
     init() {
         format = AVAudioFormat(standardFormatWithSampleRate: Double(S5L8930XI2S.sampleRate), channels: 2)!
@@ -45,10 +52,13 @@ final class HostAudioOutput: AudioOutput {
             self?.render(frameCount: frameCount, list: audioBufferList)
             return noErr
         }
+        self.source = source
         engine.attach(source)
         engine.connect(source, to: engine.mainMixerNode, format: format)
         engine.isAutoShutdownEnabled = false
-        requestPlayback()
+        // The engine is not started here. Init usually runs before iOS
+        // will activate a session, and an engine that is already "running"
+        // from that attempt stays silent for the rest of the launch.
     }
 
     private var audible = false
@@ -149,11 +159,9 @@ final class HostAudioOutput: AudioOutput {
     }
 
     private func startEngine() {
-        if needsSessionRestart, engine.isRunning {
-            engine.stop()
-        }
+        let session = AVAudioSession.sharedInstance()
         if needsSessionRestart {
-            let session = AVAudioSession.sharedInstance()
+            if engine.isRunning { engine.stop() }
             do {
                 try session.setCategory(.playback, mode: .default, options: [.mixWithOthers])
                 try? session.setPreferredSampleRate(Double(S5L8930XI2S.sampleRate))
@@ -161,24 +169,48 @@ final class HostAudioOutput: AudioOutput {
                 needsSessionRestart = false
             } catch {
                 needsSessionRestart = true
+                if !loggedSessionFailure {
+                    loggedSessionFailure = true
+                    let message = "audio| AVAudioSession failed: \(error.localizedDescription)"
+                    PodiumLog.emulator.error("\(message, privacy: .public)")
+                    onDiagnostic?(message)
+                }
             }
         }
+        guard !needsSessionRestart else {
+            scheduleLock.lock()
+            playbackLive = false
+            scheduleLock.unlock()
+            return
+        }
+        if let source {
+            engine.connect(source, to: engine.mainMixerNode, format: format)
+        }
         engine.mainMixerNode.outputVolume = volume
-        let running: Bool
-        if engine.isRunning {
-            running = true
-        } else {
+        if !engine.isRunning {
             engine.prepare()
             do {
                 try engine.start()
-                running = engine.isRunning
             } catch {
-                running = false
+                if !loggedSessionFailure {
+                    loggedSessionFailure = true
+                    let message = "audio| engine start failed: \(error.localizedDescription)"
+                    PodiumLog.emulator.error("\(message, privacy: .public)")
+                    onDiagnostic?(message)
+                }
+                scheduleLock.lock()
+                playbackLive = false
+                scheduleLock.unlock()
+                return
             }
         }
+        loggedSessionFailure = false
         scheduleLock.lock()
-        playbackLive = running && !needsSessionRestart
+        playbackLive = engine.isRunning
         scheduleLock.unlock()
+        let message = "audio| engine running, session \(session.sampleRate) Hz, mixer pulling"
+        PodiumLog.emulator.notice("\(message, privacy: .public)")
+        onDiagnostic?(message)
     }
 
     private func append(_ samples: [Float]) {
@@ -211,6 +243,12 @@ final class HostAudioOutput: AudioOutput {
             return
         }
         let frames = min(count, available / 2)
+        if !loggedRender {
+            loggedRender = true
+            let message = "audio| host pulled \(frames) of \(count) frames, ring held \(available) samples"
+            PodiumLog.emulator.notice("\(message, privacy: .public)")
+            onDiagnostic?(message)
+        }
         for frame in 0..<frames {
             let leftSample = ring[readIndex]
             readIndex = (readIndex + 1) % ring.count

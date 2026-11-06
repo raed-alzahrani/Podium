@@ -33,6 +33,10 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     static let bytesPerFrame = sampleRate / 60 * 4
 
     var output: AudioOutput?
+    /// Fired when guest PCM is handed to the host mixer. `frames` is the
+    /// stereo frame count and `peak` is the loudest sample in that chunk.
+    var onPCM: ((_ frames: Int, _ peak: Float) -> Void)?
+    private var pcmReports = 0
     private var registers = [UInt32](repeating: 0, count: Int(windowLength / 4))
     private var pending: [UInt8] = []
     private var pendingRead = 0
@@ -147,7 +151,19 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     }
 
     private func deliver() {
+        let count = frames.count / 2
+        var peak: Float = 0
+        for sample in frames {
+            let magnitude = sample < 0 ? -sample : sample
+            if magnitude > peak { peak = magnitude }
+        }
         output?.enqueue(samples: frames)
         frames.removeAll(keepingCapacity: true)
+        pcmReports += 1
+        // The first few chunks, then occasionally, so a ringtone shows up
+        // in the log without a line per guest frame.
+        if pcmReports <= 4 || pcmReports % 200 == 0 {
+            onPCM?(count, peak)
+        }
     }
 }

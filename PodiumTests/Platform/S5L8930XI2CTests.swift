@@ -42,6 +42,34 @@ final class S5L8930XI2CTests: XCTestCase {
         XCTAssertEqual([i2c.readRegister(at: 0x20), i2c.readRegister(at: 0x20)], [0x22, 0x33])
     }
 
+    /// The codec answers at 0x4a with a real chip ID, the speaker path
+    /// unmuted, and mid-scale volume. Both power-down bits make status
+    /// bit 3 come up immediately.
+    func testCodecReportsSpeakerUnmutedUntilPoweredDown() {
+        let codec = CS42L59Codec()
+        i2c.attach(codec, at: CS42L59Codec.address)
+        start(address: CS42L59Codec.address, register: 0x01, count: 1)
+        XCTAssertEqual(acknowledgeInterrupt(), S5L8930XI2C.statusDone)
+        XCTAssertEqual(i2c.readRegister(at: 0x20), 0x59)
+
+        start(address: CS42L59Codec.address, register: 0x20, count: 1)
+        XCTAssertEqual(acknowledgeInterrupt(), S5L8930XI2C.statusDone)
+        XCTAssertEqual(i2c.readRegister(at: 0x20), 0x18, "master volume reads back above mute")
+
+        start(address: CS42L59Codec.address, register: 0x38, count: 1)
+        XCTAssertEqual(acknowledgeInterrupt(), S5L8930XI2C.statusDone)
+        let awake = i2c.readRegister(at: 0x20)
+        XCTAssertEqual(awake & (1 << 3), 0)
+        XCTAssertEqual(awake & (1 << 4), 1 << 4, "speaker path is unmuted")
+        XCTAssertEqual(awake & (3 << 5), 0, "no accessory, so playback stays on the speaker")
+
+        start(address: CS42L59Codec.address, register: 0x06, count: 1, write: [0x03])
+        XCTAssertEqual(acknowledgeInterrupt(), S5L8930XI2C.statusDone)
+        start(address: CS42L59Codec.address, register: 0x38, count: 1)
+        XCTAssertEqual(acknowledgeInterrupt(), S5L8930XI2C.statusDone)
+        XCTAssertEqual(i2c.readRegister(at: 0x20) & (1 << 3), 1 << 3)
+    }
+
     /// Nothing at the address: the handler sees the not-acknowledged bit
     /// and fails the transfer instead of waiting forever.
     func testTransferToAnAbsentDeviceIsNotAcknowledged() {

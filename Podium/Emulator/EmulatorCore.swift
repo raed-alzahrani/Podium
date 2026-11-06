@@ -164,8 +164,23 @@ final class EmulatorCore {
                 }
             }
             self.session = session
-            session.platform.touch.traceTouch = { [weak self] message in
+            let record: (String) -> Void = { [weak self] message in
                 Task { @MainActor [weak self] in self?.appendLog(message) }
+            }
+            session.platform.touch.traceTouch = record
+            session.platform.i2c0.log = { message in
+                guard message.hasPrefix("i2c| 4a") else { return }
+                record(message)
+            }
+            session.platform.cdma.log = { message in
+                guard message.contains("0450") || message.contains("paced") else { return }
+                record(message)
+            }
+            session.platform.i2s0.onPCM = { frames, peak in
+                record(String(format: "audio| pcm %d frames peak %.3f -> host mixer", frames, peak))
+            }
+            if let host = output as? HostAudioOutput {
+                host.onDiagnostic = record
             }
             framebufferSource = session.display
             rateSamples = [(Date(), 0)]

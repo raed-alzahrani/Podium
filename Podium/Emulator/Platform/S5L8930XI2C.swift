@@ -133,29 +133,60 @@ final class D1815PMU: I2CRegisterFile {
 /// As on Cirrus parts, bit 7 of the register address asks for
 /// auto-increment and isn't part of it.
 ///
-/// Register 0x38 is status. AppleCS42L59Audio powers the codec down —
-/// at sleep and at shutdown — by setting both power-down bits of
-/// register 6, then polls 0x38 every 10 ms until bit 3 says it's down;
-/// here it's down at once. (Bits 5 and 6 are accessory detection, and
-/// read as nothing attached.)
+/// Register 0x01 is the chip ID (0x59). Register 0x38 is status.
+/// AppleCS42L59Audio powers the codec down — at sleep and at shutdown —
+/// by setting both power-down bits of register 6, then polls 0x38 every
+/// 10 ms until bit 3 says it's down; here it's down at once. Bits 5 and
+/// 6 are accessory detection and read as nothing attached, which is the
+/// built-in speaker. Bit 4 says that speaker path is unmuted. While the
+/// codec is up, the master and speaker volume registers read back at
+/// mid-scale until the driver writes its own gain, so a fresh codec is
+/// not sitting at zero.
 final class CS42L59Codec: I2CRegisterFile {
     static let address: UInt8 = 0x4A
+    private static let chipID: UInt8 = 0x01
+    private static let chipIDValue: UInt8 = 0x59
     private static let powerControl = 0x06
     private static let powerDown: UInt8 = 0b11
+    /// Master A/B and speaker A/B. 0x00 on this family is mute; 0x18 is
+    /// the 0 dB step the driver also programs.
+    private static let volumeRegisters: [UInt8] = [0x20, 0x21, 0x22, 0x23]
+    private static let audibleGain: UInt8 = 0x18
     private static let status: UInt8 = 0x38
     private static let poweredDown: UInt8 = 1 << 3
+    private static let speakerUnmuted: UInt8 = 1 << 4
+
+    override init(initialContents: [UInt8] = []) {
+        super.init(initialContents: initialContents)
+        registers[Int(Self.chipID)] = Self.chipIDValue
+        for address in Self.volumeRegisters where registers[Int(address)] == 0 {
+            registers[Int(address)] = Self.audibleGain
+        }
+    }
 
     override func read(register: UInt8, count: Int) -> [UInt8]? {
         let first = register & 0x7F
+        let poweredDown = registers[Int(Self.powerControl)] & Self.powerDown == Self.powerDown
         return (0..<count).map { index in
             let address = (first &+ UInt8(truncatingIfNeeded: index)) & 0x7F
+            if address == Self.chipID { return Self.chipIDValue }
             var value = registers[Int(address)]
-            if address == Self.status, registers[Self.powerControl] & Self.powerDown == Self.powerDown { value |= Self.poweredDown }
+            if address == Self.status {
+                if poweredDown {
+                    value |= Self.poweredDown
+                    value &= ~Self.speakerUnmuted
+                } else {
+                    value &= ~Self.poweredDown
+                    value |= Self.speakerUnmuted
+                }
+            }
             return value
         }
     }
 
     override func write(register: UInt8, bytes: [UInt8]) -> Bool {
         super.write(register: register & 0x7F, bytes: bytes)
+        registers[Int(Self.chipID)] = Self.chipIDValue
+        return true
     }
 }
