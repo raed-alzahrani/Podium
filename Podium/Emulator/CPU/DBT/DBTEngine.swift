@@ -753,12 +753,13 @@ final class DBTEngine {
 
     // MARK: Disk cache
 
-    /// `jit_cache.bin` in the app's sandbox (Application Support). The
-    /// code is position-independent within the JIT region: branches aim
-    /// at the runtime stubs by word offset, so the bytes copy straight
-    /// into whatever address the dual mapping got this launch.
+    /// `jit_cache.bin` in the app's sandbox (Application Support).
+    /// Branches are PC-relative. The file also stores the JIT region's
+    /// base, and load adds the new base before any block is installed.
+    /// A version, rebase, or checksum failure deletes the file and the
+    /// CPU translates again instead of jumping at the previous mapping.
     private static var cacheMagic: UInt32 { 0x4A49_5443 }
-    private static var cacheVersion: UInt32 { 1 }
+    private static var cacheVersion: UInt32 { 2 }
 
     private static var cacheURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -792,6 +793,7 @@ final class DBTEngine {
         put32(UInt32(links.count))
         put32(UInt32(slotOwners.count))
         put32(0)
+        put64(UInt64(UInt(bitPattern: region.executable)))
         for (key, coverage) in blockCoverage {
             put64(key)
             put32(UInt32(truncatingIfNeeded: coverage.offset))
@@ -849,11 +851,14 @@ final class DBTEngine {
             offset += 8
             return value
         }
-        guard let magic = take32(), magic == Self.cacheMagic,
-              let version = take32(), version == Self.cacheVersion else { return }
+        guard let magic = take32(), magic == Self.cacheMagic, let version = take32() else { return }
+        guard version == Self.cacheVersion else {
+            discardJITCache(url, reason: "it was saved for a different JIT mapping")
+            return
+        }
         guard let storedRuntime = take32(), let imageEnd = take32(),
               let blockCount = take32(), let linkCount = take32(),
-              let slotCount = take32(), take32() != nil else { return }
+              let slotCount = take32(), take32() != nil, let oldBase = take64() else { return }
         guard storedRuntime == UInt32(runtimeEnd), imageEnd >= storedRuntime,
               Int(imageEnd) <= region.size, blockCount < 2_000_000, linkCount < 4_000_000, slotCount < 4_000_000 else { return }
         struct Record {
@@ -888,13 +893,27 @@ final class DBTEngine {
         }
         let imageCount = Int(imageEnd) - runtimeEnd
         guard offset + imageCount <= data.count else { return }
-        let image = data.subdata(in: offset..<(offset + imageCount))
+        var image = data.subdata(in: offset..<(offset + imageCount))
+        guard rebase(&image, oldBase: oldBase) else {
+            discardJITCache(url, reason: "a block pointer could not be rebased")
+            return
+        }
+        let kept = records.filter { record in
+            guard record.guestBytes > 0, let page = ramHost(record.physical & 0xFFFF_F000) else { return false }
+            let guest = UnsafeRawPointer(page).advanced(by: Int(record.physical & 0xFFF))
+            return Self.hashGuest(guest, bytes: record.guestBytes) == record.hash
+        }
+        guard !kept.isEmpty else {
+            discardJITCache(url, reason: "no block matched guest memory")
+            return
+        }
+        let dropped = Set(records.map(\.key)).subtracting(kept.map(\.key))
         region.write(at: runtimeEnd, length: imageCount) { destination in
             image.withUnsafeBytes { raw in
                 if let base = raw.baseAddress { destination.copyMemory(from: base, byteCount: imageCount) }
             }
         }
-        for record in records {
+        for record in kept {
             let code = UnsafeRawPointer(region.executable + record.codeOffset)
             translations[record.key] = code
             blockCoverage[record.key] = Coverage(offset: record.codeOffset, length: record.length, physical: record.physical,
@@ -905,13 +924,78 @@ final class DBTEngine {
             markCodePage(page)
             install(record.key, code: code)
         }
-        for (slot, key) in links { linksInto[key, default: []].append(slot) }
-        for (slot, key) in slots { slotOwners[slot] = key }
+        for (slot, key) in links {
+            if dropped.contains(key) {
+                write([0x1400_0001], at: slot * 4)
+            } else {
+                linksInto[key, default: []].append(slot)
+            }
+        }
+        for (slot, key) in slots where !dropped.contains(key) { slotOwners[slot] = key }
         cursor = Int(imageEnd)
-        statistics.blocksTranslated += records.count
-        restoredBlocks = records.count
-        cacheDirty = false
-        let message = "jit cache loaded \(records.count) blocks"
+        statistics.blocksTranslated += kept.count
+        restoredBlocks = kept.count
+        cacheDirty = !dropped.isEmpty
+        let message = "jit cache restored \(kept.count) blocks, dropped \(dropped.count)"
+        PodiumLog.emulator.notice("\(message, privacy: .public)")
+    }
+
+    /// Adds `newBase - oldBase` to every 64-bit immediate that points into
+    /// the JIT region the cache was saved from. Branches are already
+    /// PC-relative. A chain that cannot express the new address fails the
+    /// load, and the caller deletes the file.
+    private func rebase(_ image: inout Data, oldBase: UInt64) -> Bool {
+        let newBase = UInt64(UInt(bitPattern: region.executable))
+        let window = UInt64(region.size)
+        if oldBase == newBase || image.isEmpty { return true }
+        let delta = newBase &- oldBase
+        let ok: Bool = image.withUnsafeMutableBytes { raw in
+            guard raw.count >= 4, let base = raw.baseAddress else { return false }
+            let words = raw.count / 4
+            let ptr = base.bindMemory(to: UInt32.self, capacity: words)
+            var index = 0
+            while index < words {
+                let word = ptr[index]
+                guard word & 0xFF80_0000 == 0xD280_0000 else { index += 1; continue }
+                let rd = word & 31
+                let firstShift = Int((word >> 21) & 3) * 16
+                var value = UInt64((word >> 5) & 0xFFFF) << firstShift
+                var parts = [(index, firstShift)]
+                var next = index + 1
+                while next < words, next < index + 4 {
+                    let insn = ptr[next]
+                    guard insn & 0xFF80_0000 == 0xF280_0000, insn & 31 == rd else { break }
+                    let shift = Int((insn >> 21) & 3) * 16
+                    guard shift != 0 else { break }
+                    value |= UInt64((insn >> 5) & 0xFFFF) << shift
+                    parts.append((next, shift))
+                    next += 1
+                }
+                if value >= oldBase, value < oldBase &+ window {
+                    let updated = value &+ delta
+                    for shift in stride(from: 0, through: 48, by: 16) {
+                        let slice = (updated >> shift) & 0xFFFF
+                        if slice != 0, !parts.contains(where: { $0.1 == shift }) { return false }
+                    }
+                    for (at, shift) in parts {
+                        let slice = UInt16(truncatingIfNeeded: (updated >> shift) & 0xFFFF)
+                        if shift == 0 {
+                            ptr[at] = 0xD280_0000 | UInt32(slice) << 5 | rd
+                        } else {
+                            ptr[at] = 0xF280_0000 | UInt32(shift / 16) << 21 | UInt32(slice) << 5 | rd
+                        }
+                    }
+                }
+                index = next
+            }
+            return true
+        }
+        return ok
+    }
+
+    private func discardJITCache(_ url: URL, reason: String) {
+        try? FileManager.default.removeItem(at: url)
+        let message = "jit cache discarded (\(reason)); translating from scratch"
         PodiumLog.emulator.notice("\(message, privacy: .public)")
     }
 

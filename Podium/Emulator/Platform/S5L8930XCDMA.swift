@@ -14,12 +14,20 @@ protocol DMAEndpoint: AnyObject {
     /// Bytes waiting (for peripheral-to-memory).
     var dmaAvailable: Int { get }
     func dmaPop() -> UInt8
+    /// A byte the guest already submitted, taken even when the sample
+    /// clock has no budget left. Stopping the channel must not discard
+    /// it. The default is a budgeted push.
+    func dmaRetain(_ byte: UInt8)
+    /// Flush whatever `dmaRetain` accumulated into the host mixer.
+    func dmaFinishTail()
 }
 
 extension DMAEndpoint {
     func dmaDiscard(_ count: Int) {
         for _ in 0..<count { dmaPush(0) }
     }
+    func dmaRetain(_ byte: UInt8) { dmaPush(byte) }
+    func dmaFinishTail() {}
 }
 
 /// The S5L8930X "CDMA" DMA engine (device tree `cdma`: channels at
@@ -207,6 +215,10 @@ final class S5L8930XCDMA: MMIODevice {
         // paused until it's aborted or started again.
         if value & Self.csrPause != 0 || old & Self.csrPaused != 0 { csr |= Self.csrPaused }
         if value & Self.csrAbort != 0 {
+            // The mixer keeps what it already has. Copy the rest of an
+            // audio buffer into it before the channel object is dropped,
+            // so a click or lock sound is not cut off at the abort.
+            retainAudioTail(channel)
             csr &= ~(Self.csrStateMask | Self.csrStart | Self.csrAbort | Self.csrPause | Self.csrPaused)
             peripheralTransfers[channel] = nil
             pacedTransfers[channel] = nil
@@ -403,6 +415,49 @@ final class S5L8930XCDMA: MMIODevice {
         setRegister(channel, 0x10, segment.address &+ UInt32(count))
         setRegister(channel, 0xC, UInt32(segment.length - count))
         setRegister(channel, 0x14, count >= segment.length ? segment.next : segment.descriptor)
+    }
+
+    /// Copies the unread tail of an audio transfer into the mixer and
+    /// leaves the DMA registers alone. Abort has already published the
+    /// in-flight position; this only keeps the sound from being cut.
+    private func retainAudioTail(_ channel: Int) {
+        let dataRegister = register(channel, 0x8) & 0x7FFF_FFFF
+        guard isAudioRegister?(dataRegister) == true else { return }
+        let bus = memory()
+        var retained = 0
+        let limit = 512 << 10
+        if var transfer = peripheralTransfers[channel], transfer.toPeripheral, !transfer.silent {
+            while transfer.segment < transfer.segments.count, retained < limit {
+                let segment = transfer.segments[transfer.segment]
+                if transfer.offset >= segment.length {
+                    transfer.segment += 1
+                    transfer.offset = 0
+                    continue
+                }
+                let address = segment.address &+ UInt32(transfer.offset)
+                transfer.endpoint.dmaRetain((try? bus.readByte(at: address)) ?? 0)
+                transfer.offset += 1
+                retained += 1
+            }
+            transfer.endpoint.dmaFinishTail()
+        }
+        if var transfer = pacedTransfers[channel], retained < limit {
+            var bytes: [UInt8] = []
+            while transfer.index < transfer.segments.count, bytes.count < limit - retained {
+                let segment = transfer.segments[transfer.index]
+                if transfer.offset >= segment.length {
+                    transfer.index += 1
+                    transfer.offset = 0
+                    continue
+                }
+                let address = segment.address &+ UInt32(transfer.offset)
+                bytes.append((try? bus.readByte(at: address)) ?? 0)
+                transfer.offset += 1
+            }
+            if !bytes.isEmpty, bytes.contains(where: { $0 != 0 }) {
+                unmodeledPeripheralWrite?(dataRegister, bytes)
+            }
+        }
     }
 
     private func publishInFlight(_ channel: Int) {

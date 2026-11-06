@@ -55,6 +55,11 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
         dmaBudget -= 1
         accept(byte)
     }
+    /// Channel abort: the byte was already in the guest buffer. It goes
+    /// to the mixer even though the sample clock has stopped granting
+    /// budget, and the host ring is left to play it out.
+    func dmaRetain(_ byte: UInt8) { accept(byte) }
+    func dmaFinishTail() { flush() }
     /// A silent playback buffer spends the sample clock and nothing else.
     /// Pushing each zero into the mixer wakes the host once a chunk and
     /// is what the guest is streaming whenever nothing is playing.
@@ -116,9 +121,14 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
         let wasTransmitting = transmitting
         registers[Int(offset / 4)] = value
         if offset == 0, wasTransmitting, !transmitting {
-            // The lock click is still in this FIFO when the channel stops.
-            // Hand it to the host before dropping the register shadow, and
-            // leave the host ring alone so that tail can finish playing.
+            // Stopping the interface does not touch the host ring. Bytes
+            // still in this FIFO, including a staged tail, are handed over
+            // and the mixer drains them after the guest has gone idle.
+            if stagedRead < staged.count {
+                for byte in staged[stagedRead...] { accept(byte) }
+            }
+            staged.removeAll(keepingCapacity: true)
+            stagedRead = 0
             flush()
             pending.removeAll()
             pendingRead = 0

@@ -199,8 +199,9 @@ enum DebianPackageInstaller {
             }
         }
         let required = totalPayload.addingReportingOverflow(metadataBytes)
-        guard !required.overflow, required.partialValue <= builder.volumeFreeBytes,
-              builder.volumeFreeBytes - required.partialValue >= minimumFreeReserve else {
+        let room = builder.expandableFreeBytes
+        guard !required.overflow, required.partialValue <= room,
+              room - required.partialValue >= minimumFreeReserve else {
             throw PackageError.insufficientPayloadSpace
         }
 

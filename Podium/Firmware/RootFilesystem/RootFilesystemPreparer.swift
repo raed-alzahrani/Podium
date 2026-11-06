@@ -131,7 +131,7 @@ enum RootFilesystemPreparer {
         try? fileManager.removeItem(at: temporary)
         try? fileManager.removeItem(at: temporaryMarker)
         do {
-            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: sourceSize)
+            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: RootFilesystemBuilder.volumeCapacity(forCurrentBytes: sourceSize))
             let updatedHeader = try readHFSPlusVolumeHeader(at: temporary)
             guard updatedHeader.freeBlocks >= UInt32(freeSpace / UInt64(updatedHeader.blockSize)) else {
                 throw PreparationError.invalidHFSImage("the rebuilt guest volume did not retain its reserved free space")
@@ -163,7 +163,7 @@ enum RootFilesystemPreparer {
         try? fileManager.removeItem(at: temporary)
         try? fileManager.removeItem(at: markerURL(for: temporary))
         do {
-            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: sourceSize)
+            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: RootFilesystemBuilder.volumeCapacity(forCurrentBytes: sourceSize))
             let updated = try readHFSPlusVolumeHeader(at: temporary)
             guard UInt64(updated.freeBlocks) * UInt64(updated.blockSize) >= freeSpace else {
                 throw PreparationError.invalidHFSImage("the installed volume did not retain the requested free-space reserve")
@@ -195,7 +195,7 @@ enum RootFilesystemPreparer {
         try? fileManager.removeItem(at: temporary)
         try? fileManager.removeItem(at: markerURL(for: temporary))
         do {
-            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: sourceSize)
+            try builder.write(to: temporary, freeSpace: freeSpace, maximumVolumeBytes: RootFilesystemBuilder.volumeCapacity(forCurrentBytes: sourceSize))
             let updated = try readHFSPlusVolumeHeader(at: temporary)
             guard UInt64(updated.freeBlocks) * UInt64(updated.blockSize) >= freeSpace else {
                 throw PreparationError.invalidHFSImage("the installed volume did not retain the requested free-space reserve")
@@ -455,7 +455,7 @@ enum RootFilesystemPreparer {
         let builder = try RootFilesystemBuilder(volume: volume)
         try RootFilesystemRecipe.apply(to: builder, keybagBootstrap: keybagBootstrap, syncDaemon: syncDaemon, firstBootState: firstBootState,
                                        bootReadFiles: bootReadFiles)
-        try builder.write(to: partial, freeSpace: RootFilesystemRecipe.freeSpace) { written in
+        try builder.write(to: partial, freeSpace: RootFilesystemRecipe.freeSpace, maximumVolumeBytes: RootFilesystemBuilder.guestVolumeCapacity) { written in
             progress(Progress(phase: .building, fraction: Double(written.bytesWritten) / Double(max(written.totalBytes, 1))))
         }
 

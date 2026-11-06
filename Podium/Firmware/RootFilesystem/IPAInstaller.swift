@@ -153,8 +153,9 @@ enum IPAInstaller {
             }
         }
         let required = totalPayload.addingReportingOverflow(metadataReserve)
-        guard !required.overflow, required.partialValue <= builder.volumeFreeBytes,
-              builder.volumeFreeBytes - required.partialValue >= minimumFreeReserve else { throw InstallError.insufficientSpace }
+        let room = builder.expandableFreeBytes
+        guard !required.overflow, required.partialValue <= room,
+              room - required.partialValue >= minimumFreeReserve else { throw InstallError.insufficientSpace }
 
         for archive in archives {
             let bundlePath = applications + "/" + archive.appName

@@ -36,7 +36,25 @@ final class RootFilesystemBuilder {
     }
 
     var fileCount: Int { records.indices.filter { !removed.contains($0) && records[$0].isFile }.count }
+    /// Guest data volume. Images already the size of a restored iPod
+    /// root grow to this; tiny test volumes stay as they are.
+    static let guestVolumeCapacity: UInt64 = 8 << 30
+    private static let expansionFloor: UInt64 = 256 << 20
+
     var volumeFreeBytes: UInt64 { UInt64(volume.header.freeBlocks) * UInt64(volume.blockSize) }
+
+    /// Free bytes after the volume is allowed to grow to
+    /// `guestVolumeCapacity`. A 795 MB image with a few dozen megabytes
+    /// free can still take an IPA.
+    var expandableFreeBytes: UInt64 {
+        let total = UInt64(volume.header.totalBlocks) * UInt64(volume.blockSize)
+        let cap = Self.volumeCapacity(forCurrentBytes: total)
+        return volumeFreeBytes &+ (cap &- total)
+    }
+
+    static func volumeCapacity(forCurrentBytes bytes: UInt64) -> UInt64 {
+        bytes >= expansionFloor ? max(bytes, guestVolumeCapacity) : bytes
+    }
 
     // MARK: Lookup
 
