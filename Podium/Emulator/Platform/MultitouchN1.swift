@@ -263,10 +263,11 @@ final class MultitouchN1: SPISlave {
     /// Loads the next frame's length and pulls ATN low for it, unless the
     /// host is between asking something and collecting the answer.
     ///
-    /// `announcing` staying true must not swallow the next packet. The
-    /// first falling edge is often acknowledged before the driver reads
-    /// the FIFO; every later frame has to latch GPIO 21 again or the VIC
-    /// line stays down and the queue grows forever.
+    /// Only a user touch in running firmware gets here, so boot never
+    /// sees this line. The pin is falling-edge: if it is already low, it
+    /// is released and fallen again so the guest gets one new edge. The
+    /// guest's GPIO acknowledge clears that edge, and the SPI read that
+    /// drains the frame releases the pin.
     private func announceIfIdle() {
         guard mode == .firmware, let frame = frames.first else { return }
         // A finished SPI transaction must not keep the attention line idle.
@@ -280,9 +281,12 @@ final class MultitouchN1: SPISlave {
         let length = frame.count + 2
         reply = Self.packet([0xEA, UInt8(length & 0xFF), UInt8(length >> 8)])
         announcing = true
+        // Already-low produces no falling edge. Park the line high, then
+        // drop it, so this frame is one pulse rather than a stuck level.
+        setAttention?(false)
         setAttention?(true)
         let status = interruptStatus?() ?? ""
-        if frames.count == 1 || frames.count % 64 == 0 || !status.contains("pending=true") {
+        if frames.count == 1 || !status.contains("pending=true") {
             note("ATN asserted, \(frames.count) frame(s) queued \(status)")
         }
     }

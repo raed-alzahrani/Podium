@@ -51,16 +51,20 @@ final class S5L8930XGPIOTests: XCTestCase {
         gpio.setInputLevel(false, pin: Int(pin))
         XCTAssertTrue(line)
         gpio.writeRegister(1 << pin, at: S5L8930XGPIO.statusBase)
-        XCTAssertTrue(line, "ATN held low keeps the VIC line pending after the guest clears the status bit")
+        XCTAssertFalse(line, "acknowledging the falling edge clears it while the pin is still low")
         gpio.setInputLevel(false, pin: Int(pin))
-        XCTAssertTrue(line, "a later packet latches the line again while it is already low")
+        XCTAssertFalse(line, "holding ATN low does not latch the line again")
         gpio.setInputLevel(true, pin: Int(pin))
+        gpio.setInputLevel(false, pin: Int(pin))
+        XCTAssertTrue(line, "a later touch is a new falling edge")
+        gpio.writeRegister(1 << pin, at: S5L8930XGPIO.statusBase)
         XCTAssertFalse(line)
     }
 
-    /// ATN often falls before the driver programs the pin. Configuring
-    /// falling-edge mode on a line that is already low has to latch.
-    func testTouchLineLatchesWhenConfiguredWhileAlreadyLow() {
+    /// A low touch line from before the driver programs the pin must not
+    /// become an interrupt when the pin is enabled. Boot would otherwise
+    /// take that stale edge and never leave it.
+    func testTouchLineStaysQuietWhenConfiguredWhileAlreadyLow() {
         var line = false
         let gpio = S5L8930XGPIO { line = $0 }
         let pin = UInt32(S5L8930XGPIO.Pin.touchInterrupt)
@@ -68,8 +72,8 @@ final class S5L8930XGPIOTests: XCTestCase {
         XCTAssertFalse(line)
         gpio.writeRegister(0x20A, at: pin * 4)
         gpio.writeRegister(1 << pin, at: S5L8930XGPIO.enableBase)
-        XCTAssertTrue(line)
-        XCTAssertEqual(gpio.readRegister(at: S5L8930XGPIO.statusBase) & (1 << pin), 1 << pin)
+        XCTAssertFalse(line)
+        XCTAssertEqual(gpio.readRegister(at: S5L8930XGPIO.statusBase) & (1 << pin), 0)
     }
 
     /// A level-low interrupt stays pending while the level holds, even
