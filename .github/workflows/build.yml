@@ -44,7 +44,11 @@ jobs:
           # land in the binary. Ad-hoc sign them in, including the DER form
           # the kernel reads on iOS 15+.
           codesign -s - --force --generate-entitlement-der --entitlements Podium.entitlements Payload/Podium.app
-          codesign -d --entitlements :- Payload/Podium.app | grep -q get-task-allow
+          # ":-" is rejected on the macOS 26 codesign. "-" is stdout, and
+          # plutil turns a DER dump into XML before the key is checked.
+          codesign -d --entitlements - Payload/Podium.app > signed-entitlements.bin
+          plutil -convert xml1 -o - signed-entitlements.bin | tee signed-entitlements.xml
+          grep -q '<key>get-task-allow</key>' signed-entitlements.xml
           zip -qry Podium.ipa Payload
 
       - uses: actions/upload-artifact@v4
