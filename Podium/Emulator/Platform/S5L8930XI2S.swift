@@ -66,10 +66,23 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
     /// Releases one guest frame of transmit audio. Called from the frame
     /// tick, not from the store that queued the buffer.
     func refillTransmitBudget() {
+        grantTransmitBudget()
+        releaseStagedAudio()
+    }
+
+    /// One more frame of FIFO budget. Playback DMA only moves bytes the
+    /// sample clock has granted, so a buffer cannot retire in the store
+    /// that queued it.
+    func grantTransmitBudget() {
         let quantum = Self.bytesPerFrame
         dmaBudget = min(dmaBudget + quantum, quantum * 2)
+    }
+
+    /// PCM staged by a channel that does not target the transmit FIFO.
+    /// One frame per call, into the host mixer.
+    func releaseStagedAudio() {
         let available = staged.count - stagedRead
-        let release = min(quantum, available)
+        let release = min(Self.bytesPerFrame, available)
         guard release > 0 else { return }
         for byte in staged[stagedRead..<(stagedRead + release)] { accept(byte) }
         stagedRead += release

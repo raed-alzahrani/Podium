@@ -210,9 +210,10 @@ final class S5L8930XPlatform: DeviceEventHandler {
             // the main thread can run the unlock animation between
             // buffers. At most one display-pipe command retires on this
             // vblank (see `S5L8930XDisplayPipe.frameEnded`).
-            i2s0.refillTransmitBudget()
+            i2s0.grantTransmitBudget()
             cdma.pumpPeripherals()
             cdma.advancePacedTransfers(byteCount: S5L8930XI2S.bytesPerFrame)
+            i2s0.releaseStagedAudio()
             displayPipe.frameEnded()
             clcd.frameEnded()
             i2s0.flush()

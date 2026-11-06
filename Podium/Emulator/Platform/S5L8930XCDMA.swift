@@ -105,7 +105,6 @@ final class S5L8930XCDMA: MMIODevice {
     /// loop can sleep, so the loop resubmits and the main guest thread
     /// never runs.
     var completionIsPaced: ((UInt32) -> Bool)?
-    private var pacedRemaining: [Int: Int] = [:]
     /// A running peripheral channel: its memory segments and progress.
     private struct PeripheralTransfer {
         let toPeripheral: Bool
@@ -117,7 +116,20 @@ final class S5L8930XCDMA: MMIODevice {
         var offset = 0
         var moved = 0
     }
+    /// A playback channel with no modeled FIFO. Bytes are handed to
+    /// `unmodeledPeripheralWrite` as the sample clock grants them, and
+    /// MAR moves with each byte. Dumping the buffer and jumping CAR to
+    /// the end in the start write leaves MAR at 0 while the command's
+    /// MA and BC describe the buffer, which is the stop-path panic.
+    private struct PacedTransfer {
+        let dataRegister: UInt32
+        var segments: [Segment]
+        let end: UInt32
+        var index = 0
+        var offset = 0
+    }
     private var peripheralTransfers: [Int: PeripheralTransfer] = [:]
+    private var pacedTransfers: [Int: PacedTransfer] = [:]
     private var pumping = false
 
     func attach(_ endpoint: DMAEndpoint, dataRegister: UInt32) {
@@ -169,6 +181,10 @@ final class S5L8930XCDMA: MMIODevice {
         let old = registers[Int(offset / 4)]
         var csr = (value & ~(Self.csrWriteOneToClear | Self.csrStateMask)) | (old & (Self.csrWriteOneToClear | Self.csrStateMask))
         csr &= ~(value & Self.csrWriteOneToClear)
+        // The stop check reads MAR against the command CAR points at as
+        // soon as this write returns. Publish the in-flight position
+        // first, so MAR, DBR and CAR describe the same byte.
+        if value & (Self.csrPause | Self.csrAbort) != 0 { publishInFlight(channel) }
         // Pausing (bit 2) halts the channel where it is, and says so in bit
         // 21 — at once here; the kernel pauses a channel before it stops
         // it (when the screen sleeps, say) and waits for that bit. It stays
@@ -177,7 +193,7 @@ final class S5L8930XCDMA: MMIODevice {
         if value & Self.csrAbort != 0 {
             csr &= ~(Self.csrStateMask | Self.csrStart | Self.csrAbort | Self.csrPause | Self.csrPaused)
             peripheralTransfers[channel] = nil
-            pacedRemaining[channel] = nil
+            pacedTransfers[channel] = nil
         }
         if value & Self.csrStart != 0, old & Self.csrStateMask == 0 {
             csr = (csr & ~(Self.csrStateMask | Self.csrPause | Self.csrPaused)) | Self.csrStateRunning
@@ -194,33 +210,32 @@ final class S5L8930XCDMA: MMIODevice {
         guard csr & Self.csrMemoryToMemory != 0 else {
             let dataRegister = register(channel, 0x8) & 0x7FFF_FFFF
             let paced = completionIsPaced?(dataRegister) ?? false
+            // DCR bit 1 is memory-to-peripheral. Playback to a paced
+            // target (the I²S FIFO) is that direction even when the bit
+            // the driver wrote isn't the one openiBoot uses; otherwise
+            // the PCM stays in guest memory, MAR never leaves MA, and
+            // the stop check panics.
+            let memoryToPeripheral = register(channel, 0x4) & 2 != 0 || paced
             guard let endpoint = endpoints[dataRegister] else {
                 let chain = walkChain(at: register(channel, 0x14))
                 let byteCount = chain.segments.reduce(0) { $0 + $1.length }
-                if register(channel, 0x4) & 2 != 0 {
-                    let bus = memory()
-                    var bytes: [UInt8] = []
-                    bytes.reserveCapacity(byteCount)
-                    for segment in chain.segments {
-                        if let chunk = try? bus.readBytes(segment.length, at: segment.address) {
-                            bytes.append(contentsOf: chunk)
-                        }
-                    }
-                    unmodeledPeripheralWrite?(dataRegister, bytes)
-                }
                 log?(String(format: "cdma| channel %d: peripheral register %08x %@ without a device (%d bytes)", channel, dataRegister, paced ? "paced" : "completed", byteCount))
-                setRegister(channel, 0x14, chain.end)
-                if paced, byteCount > 0 {
-                    pacedRemaining[channel] = byteCount
+                if paced, let first = chain.segments.first {
+                    pacedTransfers[channel] = PacedTransfer(dataRegister: dataRegister, segments: chain.segments, end: chain.end)
+                    publish(channel, first, consumed: 0)
+                } else if memoryToPeripheral {
+                    deliverUnmodeled(chain, to: dataRegister)
+                    finishConsumed(channel, chain)
                 } else {
+                    setRegister(channel, 0x14, chain.end)
                     finish(channel)
                 }
                 return
             }
-            // DCR bit 1: memory to peripheral (openiBoot's "out").
             let chain = walkChain(at: register(channel, 0x14))
-            peripheralTransfers[channel] = PeripheralTransfer(toPeripheral: register(channel, 0x4) & 2 != 0, endpoint: endpoint,
+            peripheralTransfers[channel] = PeripheralTransfer(toPeripheral: memoryToPeripheral, endpoint: endpoint,
                                                               segments: chain.segments, end: chain.end)
+            if let first = chain.segments.first { publish(channel, first, consumed: 0) }
             log?(String(format: "cdma| channel %d chain at %08x: %@ -> %08x", channel, register(channel, 0x14), chain.commands, chain.end))
             log?(String(format: "cdma| channel %d started: %@ %08x, dcr %08x, %d bytes", channel, register(channel, 0x4) & 2 != 0 ? "to" : "from",
                         dataRegister, register(channel, 0x4), peripheralTransfers[channel]!.segments.reduce(0) { $0 + $1.length }))
@@ -238,21 +253,43 @@ final class S5L8930XCDMA: MMIODevice {
         transfer(from: source, to: sink)
     }
 
-    /// Counts `byteCount` bytes off every peripheral channel whose
-    /// completion was deferred, and raises done for each one that reaches
-    /// the end. Audio calls this once per guest frame with one frame of
-    /// samples, so the work loop blocks between buffers instead of
-    /// resubmitting inside its own completion interrupt.
+    /// Counts `byteCount` bytes off every playback channel that has no
+    /// FIFO endpoint, hands those bytes to the peripheral, and advances
+    /// MAR with them. Done is raised in the same update as MAR = MA + BC
+    /// and DBR = 0, so the stop check and the completion interrupt see
+    /// one terminal state.
     func advancePacedTransfers(byteCount: Int) {
-        guard byteCount > 0, !pacedRemaining.isEmpty else { return }
-        for channel in pacedRemaining.keys.sorted() {
-            let left = (pacedRemaining[channel] ?? 0) - byteCount
-            if left <= 0 {
-                pacedRemaining[channel] = nil
-                finish(channel)
+        guard byteCount > 0, !pacedTransfers.isEmpty else { return }
+        let bus = memory()
+        for channel in pacedTransfers.keys.sorted() where register(channel, 0) & Self.csrPaused == 0 {
+            guard var transfer = pacedTransfers[channel] else { continue }
+            var grant = byteCount
+            var chunk: [UInt8] = []
+            chunk.reserveCapacity(min(grant, 4096))
+            while grant > 0, transfer.index < transfer.segments.count {
+                let segment = transfer.segments[transfer.index]
+                if transfer.offset >= segment.length {
+                    transfer.index += 1
+                    transfer.offset = 0
+                    continue
+                }
+                let address = segment.address &+ UInt32(transfer.offset)
+                chunk.append((try? bus.readByte(at: address)) ?? 0)
+                transfer.offset += 1
+                grant -= 1
+            }
+            if !chunk.isEmpty { unmodeledPeripheralWrite?(transfer.dataRegister, chunk) }
+            if transfer.index < transfer.segments.count, transfer.offset >= transfer.segments[transfer.index].length {
+                transfer.index += 1
+                transfer.offset = 0
+            }
+            if transfer.index >= transfer.segments.count {
+                pacedTransfers[channel] = nil
+                finishConsumed(channel, (segments: transfer.segments, end: transfer.end, commands: ""))
                 log?(String(format: "cdma| channel %d: paced peripheral completion", channel))
             } else {
-                pacedRemaining[channel] = left
+                publish(channel, transfer.segments[transfer.index], consumed: transfer.offset)
+                pacedTransfers[channel] = transfer
             }
         }
     }
@@ -287,10 +324,11 @@ final class S5L8930XCDMA: MMIODevice {
                 }
                 if transfer.segment >= transfer.segments.count {
                     peripheralTransfers[channel] = nil
-                    setRegister(channel, 0x14, transfer.end)
-                    finish(channel)
+                    finishConsumed(channel, (segments: transfer.segments, end: transfer.end, commands: ""))
                     log?(String(format: "cdma| channel %d: %d bytes %@ peripheral", channel, transfer.moved, transfer.toPeripheral ? "to" : "from"))
                 } else {
+                    let segment = transfer.segments[transfer.segment]
+                    publish(channel, segment, consumed: transfer.offset)
                     peripheralTransfers[channel] = transfer
                 }
             }
@@ -299,12 +337,68 @@ final class S5L8930XCDMA: MMIODevice {
 
     private func finish(_ channel: Int) {
         let csr = register(channel, 0)
-        setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
         setRegister(channel, 0xC, 0)
+        setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
         if csr & Self.csrInterruptEnable != 0 { setInterruptLine(Self.firstInterruptLine + channel, true) }
     }
 
-    private struct Segment { let address: UInt32; let length: Int }
+    /// MAR, DBR and CAR for one position in `segment`. Consumed bytes
+    /// satisfy MAR == MA + consumed and DBR == BC - consumed. A finished
+    /// segment points CAR at its successor; a segment still in progress
+    /// keeps CAR on itself, which is the command the stop check reads.
+    private func publish(_ channel: Int, _ segment: Segment, consumed: Int) {
+        let count = min(max(consumed, 0), segment.length)
+        setRegister(channel, 0x10, segment.address &+ UInt32(count))
+        setRegister(channel, 0xC, UInt32(segment.length - count))
+        setRegister(channel, 0x14, count >= segment.length ? segment.next : segment.descriptor)
+    }
+
+    private func publishInFlight(_ channel: Int) {
+        if let transfer = peripheralTransfers[channel], transfer.segment < transfer.segments.count {
+            publish(channel, transfer.segments[transfer.segment], consumed: transfer.offset)
+        } else if let transfer = pacedTransfers[channel], transfer.index < transfer.segments.count {
+            publish(channel, transfer.segments[transfer.index], consumed: transfer.offset)
+        }
+    }
+
+    private func deliverUnmodeled(_ chain: (segments: [Segment], end: UInt32, commands: String), to dataRegister: UInt32) {
+        let bus = memory()
+        var bytes: [UInt8] = []
+        for segment in chain.segments {
+            if let chunk = try? bus.readBytes(segment.length, at: segment.address) {
+                bytes.append(contentsOf: chunk)
+            }
+        }
+        if !bytes.isEmpty { unmodeledPeripheralWrite?(dataRegister, bytes) }
+    }
+
+    /// The channel has taken every byte of its chain. MAR is the last
+    /// data segment's MA + BC and DBR is 0, in the same update that raises
+    /// done. CAR stays on that segment: the stop check reads MA and BC
+    /// from the command CAR points at, and a terminator past it has
+    /// neither.
+    private func finishConsumed(_ channel: Int, _ chain: (segments: [Segment], end: UInt32, commands: String)) {
+        if let last = chain.segments.last {
+            setRegister(channel, 0x10, last.address &+ UInt32(last.length))
+            setRegister(channel, 0xC, 0)
+            setRegister(channel, 0x14, last.descriptor)
+        } else {
+            setRegister(channel, 0x14, chain.end)
+        }
+        finish(channel)
+    }
+
+    private struct Segment {
+        /// Guest physical address of this descriptor. CAR points here
+        /// while its bytes are still in flight.
+        let descriptor: UInt32
+        /// MA, the segment's memory base.
+        let address: UInt32
+        /// BC, the segment's byte count.
+        let length: Int
+        /// The descriptor CAR moves to once `length` bytes have been taken.
+        let next: UInt32
+    }
 
     private func segments(ofChainAt start: UInt32) -> [Segment] {
         walkChain(at: start).segments
@@ -323,12 +417,12 @@ final class S5L8930XCDMA: MMIODevice {
         for _ in 0..<4096 {
             guard let command = try? bus.readWord32(at: descriptor &+ 4), command != 0 else { break }
             commands.append(String(format: "%x", command))
-            if command & 3 == 3, let address = try? bus.readWord32(at: descriptor &+ 8), let length = try? bus.readWord32(at: descriptor &+ 12) {
-                result.append(Segment(address: address, length: Int(length)))
-            }
             guard let next = try? bus.readWord32(at: descriptor) else { break }
-            if command & 0x100 != 0 { descriptor = next; break }
+            if command & 3 == 3, let address = try? bus.readWord32(at: descriptor &+ 8), let length = try? bus.readWord32(at: descriptor &+ 12), length > 0 {
+                result.append(Segment(descriptor: descriptor, address: address, length: Int(length), next: next))
+            }
             descriptor = next
+            if command & 0x100 != 0 { break }
         }
         return (result, descriptor, commands.joined(separator: ","))
     }
@@ -369,9 +463,16 @@ final class S5L8930XCDMA: MMIODevice {
         }
         log?(String(format: "cdma| channels %d->%d: %d bytes, %@", source, sink, input.count, description))
         for channel in [source, sink] {
+            let chain = walkChain(at: register(channel, 0x14))
+            // One segment is the AES shape. MAR has to land on MA + BC
+            // while CAR still names that command; moving CAR would make
+            // the next stop check read a different descriptor.
+            if chain.segments.count == 1, let only = chain.segments.first {
+                setRegister(channel, 0x10, only.address &+ UInt32(only.length))
+            }
             let csr = register(channel, 0)
-            setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
             setRegister(channel, 0xC, 0)
+            setRegister(channel, 0, (csr & ~(Self.csrStateMask | Self.csrStart)) | Self.csrDone)
             if csr & Self.csrInterruptEnable != 0 { setInterruptLine(Self.firstInterruptLine + channel, true) }
         }
     }

@@ -55,6 +55,7 @@ final class HostAudioOutput: AudioOutput {
         let copy = samples
         enqueueQueue.async { [weak self] in
             guard let self else { return }
+            self.startEngine()
             self.lock.lock()
             self.append(copy)
             self.lock.unlock()

@@ -124,6 +124,8 @@ final class S5L8930XCDMATests: XCTestCase {
         XCTAssertEqual(csr & (1 << 19), 1 << 19, "done")
         XCTAssertEqual(csr & (3 << 16), 0, "no longer running")
         XCTAssertEqual(lines[0x30 + Int(channel)], true)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404, "MAR is MA + BC once the buffer has been taken")
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 0, "DBR is 0 in the same update as done")
     }
 
     /// Audio DMA must not raise done inside the store that starts the
@@ -140,14 +142,57 @@ final class S5L8930XCDMATests: XCTestCase {
         cdma.writeRegister(1 | (1 << 3), at: channel << 12)
 
         XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 0, "not done inside the start write")
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x400, "MAR starts at MA")
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 4, "DBR starts at BC")
         XCTAssertNotEqual(lines[0x30 + Int(channel)], true)
 
         cdma.advancePacedTransfers(byteCount: 2)
         XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 0)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x402)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 2)
 
         cdma.advancePacedTransfers(byteCount: 2)
         XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 1 << 19)
         XCTAssertEqual(lines[0x30 + Int(channel)], true)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404, "MAR == MA + BC when done is raised")
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 0)
+    }
+
+    /// Stopping a channel mid-buffer must report the bytes actually taken.
+    /// The kernel panics when MAR is outside [MA, MA + BC] or DBR does not
+    /// agree with it.
+    func testPauseReportsMARMatchingTheCommand() throws {
+        final class Budget: DMAEndpoint {
+            var budget = 0
+            var received: [UInt8] = []
+            var dmaSpace: Int { budget }
+            func dmaPush(_ byte: UInt8) { budget -= 1; received.append(byte) }
+            var dmaAvailable: Int { 0 }
+            func dmaPop() -> UInt8 { 0 }
+        }
+        let endpoint = Budget()
+        cdma.attach(endpoint, dataRegister: 0x0450_0410)
+        cdma.completionIsPaced = { $0 == 0x0450_0410 }
+        try write([1, 2, 3, 4], at: 0x400)
+        try chain(at: 0x100, command: 0x103, buffer: 0x400, length: 4)
+        let channel: UInt32 = 5
+        cdma.writeRegister(0x0450_0410, at: channel << 12 | 0x8)
+        cdma.writeRegister(2, at: channel << 12 | 0x4)
+        cdma.writeRegister(0x100, at: channel << 12 | 0x14)
+        cdma.writeRegister(1 | (1 << 3), at: channel << 12)
+
+        endpoint.budget = 2
+        cdma.pumpPeripherals()
+        cdma.writeRegister(1 << 2, at: channel << 12)
+
+        XCTAssertEqual(endpoint.received, [1, 2])
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x402)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 2)
+        XCTAssertNotEqual(cdma.readRegister(at: channel << 12) & (1 << 21), 0, "paused")
+        let mar = cdma.readRegister(at: channel << 12 | 0x10)
+        let ma: UInt32 = 0x400
+        let bc: UInt32 = 4
+        XCTAssertLessThanOrEqual(mar &- ma, bc)
     }
 
     /// The modeled FIFO takes bytes only as its budget allows, and the
@@ -179,6 +224,8 @@ final class S5L8930XCDMATests: XCTestCase {
         cdma.pumpPeripherals()
         XCTAssertEqual(endpoint.received, [1, 2, 3, 4])
         XCTAssertEqual(cdma.readRegister(at: channel << 12) & (1 << 19), 1 << 19)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0x10), 0x404)
+        XCTAssertEqual(cdma.readRegister(at: channel << 12 | 0xC), 0)
     }
 
     func testChannelEnableBitsReadBack() {
