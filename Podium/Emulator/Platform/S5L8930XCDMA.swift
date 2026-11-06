@@ -189,7 +189,9 @@ final class S5L8930XCDMA: MMIODevice {
                     let bus = memory()
                     var bytes: [UInt8] = []
                     for segment in chain.segments {
-                        bytes.append(contentsOf: (try? bus.readBytes(segment.length, at: segment.address)) ?? [])
+                        if let chunk = try? bus.readBytes(segment.length, at: segment.address) {
+                            bytes.append(contentsOf: chunk)
+                        }
                     }
                     unmodeledPeripheralWrite?(dataRegister, bytes)
                 }
