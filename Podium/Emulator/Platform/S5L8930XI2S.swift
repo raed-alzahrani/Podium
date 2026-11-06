@@ -55,6 +55,12 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
         dmaBudget -= 1
         accept(byte)
     }
+    /// A silent playback buffer spends the sample clock and nothing else.
+    /// Pushing each zero into the mixer wakes the host once a chunk and
+    /// is what the guest is streaming whenever nothing is playing.
+    func dmaDiscard(_ count: Int) {
+        dmaBudget = max(0, dmaBudget - count)
+    }
     var dmaAvailable: Int { 0 }
     func dmaPop() -> UInt8 { 0 }
 
@@ -159,7 +165,7 @@ final class S5L8930XI2S: MMIODevice, DMAEndpoint {
             let magnitude = sample < 0 ? -sample : sample
             if magnitude > peak { peak = magnitude }
         }
-        output?.enqueue(samples: frames)
+        if peak > 0 { output?.enqueue(samples: frames) }
         frames.removeAll(keepingCapacity: true)
         pcmReports += 1
         // The first few chunks, then occasionally, so a ringtone shows up

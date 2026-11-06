@@ -132,6 +132,9 @@ final class MultitouchN1: SPISlave {
     private var lastPacket: [UInt8] = []
     private var frameNumber: UInt8 = 0
     private var lastFrameTime: UInt32 = 0
+    /// A finger-up arrived while an older frame was still the one the
+    /// guest would read next. The lift replaces that queue.
+    private var releaseWaiting = false
 
     init() {
         reply = Self.repeated(Self.statusOK)
@@ -145,11 +148,16 @@ final class MultitouchN1: SPISlave {
         frames.removeAll()
         announcing = false
         answerPending = false
+        releaseWaiting = false
         setAttention?(false)
     }
 
     func chipSelectChanged(_ selected: Bool) {
         if self.selected, !selected {
+            // `respond` may announce the next frame. The transaction has
+            // already ended, so that announcement must not see chip select
+            // still held and refuse to raise ATN.
+            self.selected = false
             if !command.isEmpty {
                 let preview = command.prefix(24).map { String(format: "%02x", $0) }.joined(separator: " ")
                     + (command.count > 24 ? " … (\(command.count) bytes)" : "")
@@ -159,6 +167,13 @@ final class MultitouchN1: SPISlave {
             command.removeAll()
             sentThisFrame.removeAll()
             replyIndex = 0
+            if releaseWaiting {
+                releaseWaiting = false
+                answerPending = false
+                if frames.count > 1 { frames = [frames[frames.count - 1]] }
+                announceIfIdle()
+            }
+            return
         }
         self.selected = selected
     }
@@ -200,7 +215,20 @@ final class MultitouchN1: SPISlave {
             current.state = 5 // BreakTouch: lifted, still in range
             finger = current
         }
-        if !selected { answerPending = false }
+        if phase == .ended {
+            // The coordinate the guest already has on the wire can finish.
+            // Anything queued behind it is a stale press; the lift is the
+            // frame that has to come out next or the finger stays down.
+            releaseWaiting = true
+            if announcing, !frames.isEmpty {
+                frames = [frames[0]]
+            } else {
+                frames.removeAll()
+            }
+            if !selected { answerPending = false }
+        } else if frames.count > 2 {
+            frames = [frames[0], frames[frames.count - 1]]
+        }
         emitFrame(time: time)
         if phase != .moved {
             note("digitizer \(phase) sensor \(Int(sensorX)),\(Int(sensorY)) on \(Self.surfaceWidth)×\(Self.surfaceHeight) (hundredths of a mm, origin bottom-left) firmware=\(mode == .firmware) \(interruptStatus?() ?? "")")
@@ -269,12 +297,21 @@ final class MultitouchN1: SPISlave {
     /// guest's GPIO acknowledge clears that edge, and the SPI read that
     /// drains the frame releases the pin.
     private func announceIfIdle() {
-        guard mode == .firmware, let frame = frames.first else { return }
-        // A finished SPI transaction must not keep the attention line idle.
-        // The driver only comes back to the FIFO when that line falls, so a
-        // stuck "reply not collected" flag would swallow every finger.
-        if !selected { answerPending = false }
-        guard !selected, !answerPending else {
+        guard mode == .firmware, !frames.isEmpty else { return }
+        // Chip select is up and no frame body is sitting in the reply
+        // register. A stuck answerPending here is the previous packet,
+        // and a finger-up has to replace it or the guest keeps the old
+        // coordinate. While a body is already loaded (`announcing`),
+        // leave it for the read in progress.
+        if !selected, !announcing {
+            answerPending = false
+            if releaseWaiting {
+                releaseWaiting = false
+                if frames.count > 1 { frames = [frames[frames.count - 1]] }
+            }
+        }
+        guard let frame = frames.first else { return }
+        guard !selected, !answerPending, !announcing else {
             note("frame queued (\(frames.count), \(frame.count) bytes) but ATN not raised: announcing=\(announcing) answerPending=\(answerPending) selected=\(selected)")
             return
         }

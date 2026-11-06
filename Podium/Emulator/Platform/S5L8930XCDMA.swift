@@ -8,9 +8,18 @@ protocol DMAEndpoint: AnyObject {
     /// Bytes the endpoint can take now (for memory-to-peripheral).
     var dmaSpace: Int { get }
     func dmaPush(_ byte: UInt8)
+    /// Drop `count` bytes of silence without presenting them. The default
+    /// pushes zeros one by one; the I²S FIFO just spends budget.
+    func dmaDiscard(_ count: Int)
     /// Bytes waiting (for peripheral-to-memory).
     var dmaAvailable: Int { get }
     func dmaPop() -> UInt8
+}
+
+extension DMAEndpoint {
+    func dmaDiscard(_ count: Int) {
+        for _ in 0..<count { dmaPush(0) }
+    }
 }
 
 /// The S5L8930X "CDMA" DMA engine (device tree `cdma`: channels at
@@ -119,6 +128,9 @@ final class S5L8930XCDMA: MMIODevice {
         var segment = 0
         var offset = 0
         var moved = 0
+        /// The whole buffer is zeros. Advance it on the sample clock
+        /// without copying each byte into the mixer.
+        var silent = false
     }
     /// A playback channel with no modeled FIFO. Bytes are handed to
     /// `unmodeledPeripheralWrite` as the sample clock grants them, and
@@ -216,16 +228,22 @@ final class S5L8930XCDMA: MMIODevice {
             let audio = isAudioRegister?(dataRegister) ?? false
             // Tests set only `completionIsPaced`. The platform sets both,
             // and pacing applies only while that register's clock is running.
-            let paced = isAudioRegister == nil
+            let pacedByClock = isAudioRegister == nil
                 ? (completionIsPaced?(dataRegister) ?? false)
                 : audio && (completionIsPaced?(dataRegister) ?? false)
+            let chain = walkChain(at: register(channel, 0x14))
+            let chainBytes = chain.segments.reduce(0) { $0 + $1.length }
+            // A full playback buffer, silent or not, has to take its real
+            // time. Completing 64 KB of zeros inside the start write lets
+            // the audio work loop resubmit on every poll, and that poll
+            // is an MMIO load the translator cannot keep in a block.
+            let paced = pacedByClock || (audio && chainBytes >= 2_048)
             // DCR bit 1 is memory-to-peripheral. Playback to a paced
             // target (the I²S FIFO) is that direction even when the bit
             // the driver wrote isn't the one openiBoot uses; otherwise
             // the PCM stays in guest memory, MAR never leaves MA, and
             // the stop check panics.
             let memoryToPeripheral = register(channel, 0x4) & 2 != 0 || paced
-            let chain = walkChain(at: register(channel, 0x14))
             // Empty commands, and any I²S program while the clock is
             // stopped, are probes. Finish them here. A paced playback
             // buffer is the only transfer allowed to wait for the sample
@@ -250,8 +268,9 @@ final class S5L8930XCDMA: MMIODevice {
                 }
                 return
             }
+            let silent = audio && paced && chainIsSilent(chain.segments)
             peripheralTransfers[channel] = PeripheralTransfer(toPeripheral: memoryToPeripheral, endpoint: endpoint,
-                                                              segments: chain.segments, end: chain.end)
+                                                              segments: chain.segments, end: chain.end, silent: silent)
             if paced {
                 publish(channel, chain.segments[0], consumed: 0)
             }
@@ -331,6 +350,15 @@ final class S5L8930XCDMA: MMIODevice {
                     let address = segment.address &+ UInt32(transfer.offset)
                     if transfer.toPeripheral {
                         guard transfer.endpoint.dmaSpace > 0 else { break }
+                        if transfer.silent {
+                            let remain = segment.length - transfer.offset
+                            let take = min(transfer.endpoint.dmaSpace, remain)
+                            transfer.endpoint.dmaDiscard(take)
+                            transfer.offset += take
+                            transfer.moved += take
+                            progress = true
+                            continue
+                        }
                         transfer.endpoint.dmaPush((try? bus.readByte(at: address)) ?? 0)
                     } else {
                         guard transfer.endpoint.dmaAvailable > 0 else { break }
@@ -383,6 +411,18 @@ final class S5L8930XCDMA: MMIODevice {
         } else if let transfer = pacedTransfers[channel], transfer.index < transfer.segments.count {
             publish(channel, transfer.segments[transfer.index], consumed: transfer.offset)
         }
+    }
+
+    /// True when every byte of the chain is zero. Silence is still paced
+    /// so the guest's audio thread waits out the buffer, but it is not
+    /// copied into the mixer one sample at a time.
+    private func chainIsSilent(_ segments: [Segment]) -> Bool {
+        let bus = memory()
+        for segment in segments {
+            guard let bytes = try? bus.readBytes(segment.length, at: segment.address) else { return false }
+            if bytes.contains(where: { $0 != 0 }) { return false }
+        }
+        return !segments.isEmpty
     }
 
     private func deliverUnmodeled(_ chain: (segments: [Segment], end: UInt32, commands: String), to dataRegister: UInt32) {
