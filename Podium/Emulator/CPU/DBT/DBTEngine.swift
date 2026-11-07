@@ -804,8 +804,9 @@ final class DBTEngine {
         let imageCount = cursor - runtimeEnd
         guard imageCount > 0, imageCount % 4 == 0, runtimeEnd + imageCount <= region.size else { return }
         var words = [UInt32](repeating: 0, count: imageCount / 4)
-        words.withUnsafeMutableBytes { destination in
-            destination.baseAddress?.copyMemory(from: region.writable.advanced(by: runtimeEnd), byteCount: imageCount)
+        let source = region.writable.advanced(by: runtimeEnd)
+        for index in 0..<words.count {
+            words[index] = source.load(fromByteOffset: index * 4, as: UInt32.self)
         }
         let rx = UInt64(UInt(bitPattern: region.executable))
         let rw = UInt64(UInt(bitPattern: region.writable))
@@ -868,15 +869,16 @@ final class DBTEngine {
             put32(UInt32(relocation.wordIndex))
             put32(relocation.kind)
         }
-        var image = Data(count: words.count * 4)
-        image.withUnsafeMutableBytes { destination in
-            words.withUnsafeBytes { source in
-                if let from = source.baseAddress, let to = destination.baseAddress {
-                    to.copyMemory(from: from, byteCount: image.count)
-                }
+        var imageBytes = [UInt8]()
+        imageBytes.reserveCapacity(words.count * 4)
+        for word in words {
+            var rest = word
+            for _ in 0..<4 {
+                imageBytes.append(UInt8(truncatingIfNeeded: rest))
+                rest >>= 8
             }
         }
-        data.append(image)
+        data.append(contentsOf: imageBytes)
         cacheDirty = false
         let url = Self.cacheURL
         do {
@@ -1037,11 +1039,7 @@ final class DBTEngine {
         }
         guard !kept.isEmpty else { throw JITCacheError.rejected("no block matched guest memory") }
         let dropped = Set(records.map(\.key)).subtracting(kept.map(\.key))
-        region.write(at: runtimeEnd, length: imageCount) { destination in
-            words.withUnsafeBytes { raw in
-                if let base = raw.baseAddress { destination.copyMemory(from: base, byteCount: imageCount) }
-            }
-        }
+        write(words, at: runtimeEnd)
         for record in kept {
             let code = UnsafeRawPointer(region.executable + record.codeOffset)
             translations[record.key] = code
