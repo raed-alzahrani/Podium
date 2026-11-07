@@ -754,12 +754,24 @@ final class DBTEngine {
     // MARK: Disk cache
 
     /// `jit_cache.bin` in the app's sandbox (Application Support).
-    /// Branches are PC-relative. The file also stores the JIT region's
-    /// base, and load adds the new base before any block is installed.
-    /// A version, rebase, or checksum failure deletes the file and the
-    /// CPU translates again instead of jumping at the previous mapping.
-    private static var cacheMagic: UInt32 { 0x4A49_5443 }
-    private static var cacheVersion: UInt32 { 2 }
+    ///
+    /// The file stores guest keys and code offsets from the start of the
+    /// JIT region. It does not store a host address. Load adds the current
+    /// `jit_rx_base` for block entries and the dispatch table, and the
+    /// current executable or writable base for any pointer the translator
+    /// embedded. A bad header, build hash, offset, or branch deletes the
+    /// file and translation starts over.
+    private static var cacheMagic: UInt32 { JITCacheImage.magic }
+    private static var cacheVersion: UInt32 { JITCacheImage.version }
+
+    private enum JITCacheError: LocalizedError {
+        case rejected(String)
+        var errorDescription: String? {
+            switch self {
+            case .rejected(let reason): return reason
+            }
+        }
+    }
 
     private static var cacheURL: URL {
         let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
@@ -767,18 +779,56 @@ final class DBTEngine {
         return base.appendingPathComponent("jit_cache.bin")
     }
 
+    /// Hash of the runtime stubs plus the region shape. A translator
+    /// change makes every saved branch into those stubs invalid.
+    private func jitCacheBuildHash() -> UInt64 {
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        var offset = 0
+        while offset + 4 <= runtimeEnd {
+            let word = UInt64(region.writable.load(fromByteOffset: offset, as: UInt32.self))
+            hash ^= word
+            hash &*= 0x100_0000_01b3
+            offset += 4
+        }
+        hash ^= UInt64(region.size)
+        hash &*= 0x100_0000_01b3
+        hash ^= UInt64(Self.tableEntries)
+        hash &*= 0x100_0000_01b3
+        return hash
+    }
+
     /// Writes the current translations. Called on the emulation thread,
     /// once the lock screen is up and again when the session stops.
     func checkpointJITCache() {
         guard cacheDirty, !Self.recordBlocks, cursor > runtimeEnd, !blockCoverage.isEmpty else { return }
+        let imageCount = cursor - runtimeEnd
+        guard imageCount > 0, imageCount % 4 == 0, runtimeEnd + imageCount <= region.size else { return }
+        var words = [UInt32](repeating: 0, count: imageCount / 4)
+        words.withUnsafeMutableBytes { destination in
+            destination.baseAddress?.copyMemory(from: region.writable.advanced(by: runtimeEnd), byteCount: imageCount)
+        }
+        let rx = UInt64(UInt(bitPattern: region.executable))
+        let rw = UInt64(UInt(bitPattern: region.writable))
+        guard let relocations = JITCacheImage.relativize(&words, rx: rx, rw: rw, window: UInt64(region.size)) else {
+            try? FileManager.default.removeItem(at: Self.cacheURL)
+            let message = "jit cache not saved: a pointer could not be stored as an offset"
+            PodiumLog.emulator.error("\(message, privacy: .public)")
+            return
+        }
         var data = Data()
         func put32(_ value: UInt32) {
-            var little = value.littleEndian
-            withUnsafeBytes(of: &little) { data.append(contentsOf: Array($0)) }
+            var rest = value
+            for _ in 0..<4 {
+                data.append(UInt8(truncatingIfNeeded: rest))
+                rest >>= 8
+            }
         }
         func put64(_ value: UInt64) {
-            var little = value.littleEndian
-            withUnsafeBytes(of: &little) { data.append(contentsOf: Array($0)) }
+            var rest = value
+            for _ in 0..<8 {
+                data.append(UInt8(truncatingIfNeeded: rest))
+                rest >>= 8
+            }
         }
         var links: [(UInt32, UInt64)] = []
         links.reserveCapacity(linksInto.count)
@@ -787,13 +837,13 @@ final class DBTEngine {
         }
         put32(Self.cacheMagic)
         put32(Self.cacheVersion)
+        put64(jitCacheBuildHash())
         put32(UInt32(runtimeEnd))
         put32(UInt32(cursor))
         put32(UInt32(blockCoverage.count))
         put32(UInt32(links.count))
         put32(UInt32(slotOwners.count))
-        put32(0)
-        put64(UInt64(UInt(bitPattern: region.executable)))
+        put32(UInt32(relocations.count))
         for (key, coverage) in blockCoverage {
             put64(key)
             put32(UInt32(truncatingIfNeeded: coverage.offset))
@@ -814,9 +864,19 @@ final class DBTEngine {
             put32(0)
             put64(key)
         }
-        let imageCount = cursor - runtimeEnd
-        guard imageCount > 0, runtimeEnd + imageCount <= region.size else { return }
-        data.append(Data(bytes: region.writable.advanced(by: runtimeEnd), count: imageCount))
+        for relocation in relocations {
+            put32(UInt32(relocation.wordIndex))
+            put32(relocation.kind)
+        }
+        var image = Data(count: words.count * 4)
+        image.withUnsafeMutableBytes { destination in
+            words.withUnsafeBytes { source in
+                if let from = source.baseAddress, let to = destination.baseAddress {
+                    to.copyMemory(from: from, byteCount: image.count)
+                }
+            }
+        }
+        data.append(image)
         cacheDirty = false
         let url = Self.cacheURL
         do {
@@ -833,34 +893,58 @@ final class DBTEngine {
     private func loadJITCache() {
         guard !Self.recordBlocks else { return }
         let url = Self.cacheURL
-        guard let data = try? Data(contentsOf: url), data.count > 32 else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do {
+            try restoreJITCache(from: url)
+        } catch {
+            discardJITCache(url, reason: error.localizedDescription)
+        }
+    }
+
+    /// Installs the cache, or throws before any block is published.
+    /// Failure leaves the translator empty so boot translates from scratch.
+    private func restoreJITCache(from url: URL) throws {
+        let data = try Data(contentsOf: url)
         var offset = 0
-        func take32() -> UInt32? {
-            guard offset + 4 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<(offset + 4)).withUnsafeBytes { raw in
-                raw.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
+        func take32() throws -> UInt32 {
+            guard offset + 4 <= data.count else { throw JITCacheError.rejected("the file is truncated") }
+            var value: UInt32 = 0
+            for shift in 0..<4 {
+                value |= UInt32(data[offset + shift]) << (shift * 8)
             }
             offset += 4
             return value
         }
-        func take64() -> UInt64? {
-            guard offset + 8 <= data.count else { return nil }
-            let value = data.subdata(in: offset..<(offset + 8)).withUnsafeBytes { raw in
-                raw.loadUnaligned(fromByteOffset: 0, as: UInt64.self)
+        func take64() throws -> UInt64 {
+            guard offset + 8 <= data.count else { throw JITCacheError.rejected("the file is truncated") }
+            var value: UInt64 = 0
+            for shift in 0..<8 {
+                value |= UInt64(data[offset + shift]) << (shift * 8)
             }
             offset += 8
             return value
         }
-        guard let magic = take32(), magic == Self.cacheMagic, let version = take32() else { return }
+        let magic = try take32()
+        guard magic == Self.cacheMagic else { throw JITCacheError.rejected("the file header is not a JIT cache") }
+        let version = try take32()
         guard version == Self.cacheVersion else {
-            discardJITCache(url, reason: "it was saved for a different JIT mapping")
-            return
+            throw JITCacheError.rejected("it was saved by a different translator")
         }
-        guard let storedRuntime = take32(), let imageEnd = take32(),
-              let blockCount = take32(), let linkCount = take32(),
-              let slotCount = take32(), take32() != nil, let oldBase = take64() else { return }
-        guard storedRuntime == UInt32(runtimeEnd), imageEnd >= storedRuntime,
-              Int(imageEnd) <= region.size, blockCount < 2_000_000, linkCount < 4_000_000, slotCount < 4_000_000 else { return }
+        let buildHash = try take64()
+        guard buildHash == jitCacheBuildHash() else {
+            throw JITCacheError.rejected("build hash does not match this translator")
+        }
+        let storedRuntime = try take32()
+        let imageEnd = try take32()
+        let blockCount = try take32()
+        let linkCount = try take32()
+        let slotCount = try take32()
+        let relocCount = try take32()
+        guard storedRuntime == UInt32(runtimeEnd), imageEnd >= storedRuntime, imageEnd % 4 == 0,
+              Int(imageEnd) <= region.size, blockCount > 0, blockCount < 2_000_000,
+              linkCount < 4_000_000, slotCount < 4_000_000, relocCount < 4_000_000 else {
+            throw JITCacheError.rejected("the header counts are not a valid cache")
+        }
         struct Record {
             var key: UInt64
             var codeOffset: Int
@@ -872,44 +956,89 @@ final class DBTEngine {
         }
         var records: [Record] = []
         records.reserveCapacity(Int(blockCount))
+        let imageLimit = Int(imageEnd)
         for _ in 0..<Int(blockCount) {
-            guard let key = take64(), let codeOffset = take32(), let length = take32(),
-                  let physical = take32(), let guestBytes = take32(), let hash = take64(),
-                  let virtualPage = take32(), take32() != nil else { return }
-            let start = Int(codeOffset), bytes = Int(length)
-            guard start >= runtimeEnd, bytes > 0, start + bytes <= Int(imageEnd) else { return }
-            records.append(Record(key: key, codeOffset: start, length: bytes, physical: physical,
-                                  guestBytes: Int(guestBytes), hash: hash, virtualPage: virtualPage))
+            let key = try take64()
+            let codeOffset = Int(try take32())
+            let length = Int(try take32())
+            let physical = try take32()
+            let guestBytes = Int(try take32())
+            let hash = try take64()
+            let virtualPage = try take32()
+            _ = try take32()
+            guard codeOffset >= runtimeEnd, codeOffset % 4 == 0, length > 0, length % 4 == 0,
+                  codeOffset + length <= imageLimit, guestBytes > 0, guestBytes <= 0x1000 else {
+                throw JITCacheError.rejected("a block offset is outside the JIT region")
+            }
+            records.append(Record(key: key, codeOffset: codeOffset, length: length, physical: physical,
+                                  guestBytes: guestBytes, hash: hash, virtualPage: virtualPage))
         }
         var links: [(Int, UInt64)] = []
+        links.reserveCapacity(Int(linkCount))
         for _ in 0..<Int(linkCount) {
-            guard let slot = take32(), take32() != nil, let key = take64() else { return }
-            links.append((Int(slot), key))
+            let slot = Int(try take32())
+            _ = try take32()
+            let key = try take64()
+            let byte = slot * 4
+            guard byte >= runtimeEnd, byte + 4 <= imageLimit else {
+                throw JITCacheError.rejected("a jump slot is outside the JIT region")
+            }
+            links.append((slot, key))
         }
         var slots: [(Int, UInt64)] = []
+        slots.reserveCapacity(Int(slotCount))
         for _ in 0..<Int(slotCount) {
-            guard let slot = take32(), take32() != nil, let key = take64() else { return }
-            slots.append((Int(slot), key))
+            let slot = Int(try take32())
+            _ = try take32()
+            let key = try take64()
+            let byte = slot * 4
+            guard byte >= runtimeEnd, byte + 4 <= imageLimit else {
+                throw JITCacheError.rejected("a jump slot is outside the JIT region")
+            }
+            slots.append((slot, key))
         }
-        let imageCount = Int(imageEnd) - runtimeEnd
-        guard offset + imageCount <= data.count else { return }
-        var image = data.subdata(in: offset..<(offset + imageCount))
-        guard rebase(&image, oldBase: oldBase) else {
-            discardJITCache(url, reason: "a block pointer could not be rebased")
-            return
+        var relocations: [JITCacheImage.Relocation] = []
+        relocations.reserveCapacity(Int(relocCount))
+        let imageWords = (imageLimit - runtimeEnd) / 4
+        for _ in 0..<Int(relocCount) {
+            let wordIndex = Int(try take32())
+            let kind = try take32()
+            guard wordIndex >= 0, wordIndex < imageWords,
+                  kind == JITCacheImage.kindExecutable || kind == JITCacheImage.kindWritable else {
+                throw JITCacheError.rejected("a relocation is outside the JIT region")
+            }
+            relocations.append(JITCacheImage.Relocation(wordIndex: wordIndex, kind: kind))
+        }
+        let imageCount = imageLimit - runtimeEnd
+        guard offset + imageCount == data.count else {
+            throw JITCacheError.rejected("the file is truncated")
+        }
+        var words = [UInt32](repeating: 0, count: imageWords)
+        for index in 0..<imageWords {
+            var value: UInt32 = 0
+            let start = offset + index * 4
+            for shift in 0..<4 {
+                value |= UInt32(data[start + shift]) << (shift * 8)
+            }
+            words[index] = value
+        }
+        let rx = UInt64(UInt(bitPattern: region.executable))
+        let rw = UInt64(UInt(bitPattern: region.writable))
+        guard JITCacheImage.rebase(&words, relocations: relocations, rx: rx, rw: rw, window: UInt64(region.size)) else {
+            throw JITCacheError.rejected("a pointer could not be rebased onto the current JIT mapping")
+        }
+        guard JITCacheImage.jumpsStayInRegion(words, regionWord: runtimeEnd / 4, regionWords: region.size / 4) else {
+            throw JITCacheError.rejected("a branch leaves the JIT region")
         }
         let kept = records.filter { record in
-            guard record.guestBytes > 0, let page = ramHost(record.physical & 0xFFFF_F000) else { return false }
+            guard let page = ramHost(record.physical & 0xFFFF_F000) else { return false }
             let guest = UnsafeRawPointer(page).advanced(by: Int(record.physical & 0xFFF))
             return Self.hashGuest(guest, bytes: record.guestBytes) == record.hash
         }
-        guard !kept.isEmpty else {
-            discardJITCache(url, reason: "no block matched guest memory")
-            return
-        }
+        guard !kept.isEmpty else { throw JITCacheError.rejected("no block matched guest memory") }
         let dropped = Set(records.map(\.key)).subtracting(kept.map(\.key))
         region.write(at: runtimeEnd, length: imageCount) { destination in
-            image.withUnsafeBytes { raw in
+            words.withUnsafeBytes { raw in
                 if let base = raw.baseAddress { destination.copyMemory(from: base, byteCount: imageCount) }
             }
         }
@@ -932,65 +1061,12 @@ final class DBTEngine {
             }
         }
         for (slot, key) in slots where !dropped.contains(key) { slotOwners[slot] = key }
-        cursor = Int(imageEnd)
+        cursor = imageLimit
         statistics.blocksTranslated += kept.count
         restoredBlocks = kept.count
         cacheDirty = !dropped.isEmpty
-        let message = "jit cache restored \(kept.count) blocks, dropped \(dropped.count)"
+        let message = "jit cache restored \(kept.count) blocks, dropped \(dropped.count), rx 0x\(String(rx, radix: 16))"
         PodiumLog.emulator.notice("\(message, privacy: .public)")
-    }
-
-    /// Adds `newBase - oldBase` to every 64-bit immediate that points into
-    /// the JIT region the cache was saved from. Branches are already
-    /// PC-relative. A chain that cannot express the new address fails the
-    /// load, and the caller deletes the file.
-    private func rebase(_ image: inout Data, oldBase: UInt64) -> Bool {
-        let newBase = UInt64(UInt(bitPattern: region.executable))
-        let window = UInt64(region.size)
-        if oldBase == newBase || image.isEmpty { return true }
-        let delta = newBase &- oldBase
-        let ok: Bool = image.withUnsafeMutableBytes { raw in
-            guard raw.count >= 4, let base = raw.baseAddress else { return false }
-            let words = raw.count / 4
-            let ptr = base.bindMemory(to: UInt32.self, capacity: words)
-            var index = 0
-            while index < words {
-                let word = ptr[index]
-                guard word & 0xFF80_0000 == 0xD280_0000 else { index += 1; continue }
-                let rd = word & 31
-                let firstShift = Int((word >> 21) & 3) * 16
-                var value = UInt64((word >> 5) & 0xFFFF) << firstShift
-                var parts = [(index, firstShift)]
-                var next = index + 1
-                while next < words, next < index + 4 {
-                    let insn = ptr[next]
-                    guard insn & 0xFF80_0000 == 0xF280_0000, insn & 31 == rd else { break }
-                    let shift = Int((insn >> 21) & 3) * 16
-                    guard shift != 0 else { break }
-                    value |= UInt64((insn >> 5) & 0xFFFF) << shift
-                    parts.append((next, shift))
-                    next += 1
-                }
-                if value >= oldBase, value < oldBase &+ window {
-                    let updated = value &+ delta
-                    for shift in stride(from: 0, through: 48, by: 16) {
-                        let slice = (updated >> shift) & 0xFFFF
-                        if slice != 0, !parts.contains(where: { $0.1 == shift }) { return false }
-                    }
-                    for (at, shift) in parts {
-                        let slice = UInt16(truncatingIfNeeded: (updated >> shift) & 0xFFFF)
-                        if shift == 0 {
-                            ptr[at] = 0xD280_0000 | UInt32(slice) << 5 | rd
-                        } else {
-                            ptr[at] = 0xF280_0000 | UInt32(shift / 16) << 21 | UInt32(slice) << 5 | rd
-                        }
-                    }
-                }
-                index = next
-            }
-            return true
-        }
-        return ok
     }
 
     private func discardJITCache(_ url: URL, reason: String) {
@@ -1079,5 +1155,135 @@ final class DBTEngine {
         for page in Set(added.map { $0 & 0xFFFF_F000 }) {
             for key in keysByVirtualPage.removeValue(forKey: page) ?? [] { discard(key) }
         }
+    }
+}
+
+/// Position-independent form of a saved JIT image.
+///
+/// Host pointers are not written to disk. A `movz`/`movk` chain that
+/// points into the executable (`jit_rx_base`) or writable (`jit_rw_base`)
+/// mapping is stored as an offset from that mapping. Load adds the
+/// current base back. Direct branches stay PC-relative and are rejected
+/// when they leave the region.
+enum JITCacheImage {
+    static let magic: UInt32 = 0x4A49_5443
+    static let version: UInt32 = 3
+    /// The chain addresses the executable mapping.
+    static let kindExecutable: UInt32 = 1
+    /// The chain addresses the writable alias of the same region.
+    static let kindWritable: UInt32 = 2
+
+    struct Relocation: Equatable {
+        var wordIndex: Int
+        var kind: UInt32
+    }
+
+    /// Rewrites pointer chains in `words` to offsets. Nil when a pointer
+    /// in either window does not fit in the instruction slots as an offset.
+    static func relativize(_ words: inout [UInt32], rx: UInt64, rw: UInt64, window: UInt64) -> [Relocation]? {
+        var relocations: [Relocation] = []
+        var index = 0
+        while index < words.count {
+            guard let chain = chain(in: words, at: index) else { index += 1; continue }
+            let kind = kindOf(chain.value, rx: rx, rw: rw, window: window)
+            let next = chain.parts.map(\.0).max().map { $0 + 1 } ?? (index + 1)
+            if let kind {
+                let base = kind == kindExecutable ? rx : rw
+                guard encode(chain.value &- base, rd: chain.rd, parts: chain.parts, into: &words) else { return nil }
+                relocations.append(Relocation(wordIndex: index, kind: kind))
+            }
+            index = next
+        }
+        return relocations
+    }
+
+    /// Adds the current executable or writable base to every relocation.
+    /// False when an offset is outside the region or the new address does
+    /// not fit the saved instruction slots.
+    static func rebase(_ words: inout [UInt32], relocations: [Relocation], rx: UInt64, rw: UInt64, window: UInt64) -> Bool {
+        for relocation in relocations {
+            guard let chain = chain(in: words, at: relocation.wordIndex) else { return false }
+            let base: UInt64
+            switch relocation.kind {
+            case kindExecutable: base = rx
+            case kindWritable: base = rw
+            default: return false
+            }
+            let offset = chain.value
+            guard offset < window else { return false }
+            let updated = base &+ offset
+            guard updated >= base, updated < base &+ window else { return false }
+            guard encode(updated, rd: chain.rd, parts: chain.parts, into: &words) else { return false }
+        }
+        return true
+    }
+
+    /// `b` and `bl` in an image placed at `regionWord` land inside the region.
+    static func jumpsStayInRegion(_ words: [UInt32], regionWord: Int, regionWords: Int) -> Bool {
+        guard regionWords > 0, regionWord >= 0, regionWord + words.count <= regionWords else { return false }
+        for (index, word) in words.enumerated() {
+            let opcode = word & 0xFC00_0000
+            guard opcode == 0x1400_0000 || opcode == 0x9400_0000 else { continue }
+            let imm = Int64(word & 0x03FF_FFFF)
+            let signed = (imm << 38) >> 38
+            let target = Int64(regionWord + index) + signed
+            if target < 0 || target >= Int64(regionWords) { return false }
+        }
+        return true
+    }
+
+    /// The pointer assembled by the chain at `index`, after a rebase.
+    static func chainedValue(_ words: [UInt32], at index: Int) -> UInt64? {
+        chain(in: words, at: index)?.value
+    }
+
+    private struct Chain {
+        var rd: UInt32
+        var parts: [(index: Int, shift: Int)]
+        var value: UInt64
+    }
+
+    private static func kindOf(_ value: UInt64, rx: UInt64, rw: UInt64, window: UInt64) -> UInt32? {
+        if value >= rx, value < rx &+ window { return kindExecutable }
+        if rw != rx, value >= rw, value < rw &+ window { return kindWritable }
+        return nil
+    }
+
+    private static func chain(in words: [UInt32], at index: Int) -> Chain? {
+        guard index >= 0, index < words.count else { return nil }
+        let word = words[index]
+        guard word & 0xFF80_0000 == 0xD280_0000 else { return nil }
+        let rd = word & 31
+        let firstShift = Int((word >> 21) & 3) * 16
+        var value = UInt64((word >> 5) & 0xFFFF) << firstShift
+        var parts = [(index, firstShift)]
+        var next = index + 1
+        while next < words.count, next < index + 4 {
+            let insn = words[next]
+            guard insn & 0xFF80_0000 == 0xF280_0000, insn & 31 == rd else { break }
+            let shift = Int((insn >> 21) & 3) * 16
+            guard shift != 0, !parts.contains(where: { $0.1 == shift }) else { break }
+            value |= UInt64((insn >> 5) & 0xFFFF) << shift
+            parts.append((next, shift))
+            next += 1
+        }
+        return Chain(rd: rd, parts: parts, value: value)
+    }
+
+    private static func encode(_ value: UInt64, rd: UInt32, parts: [(index: Int, shift: Int)], into words: inout [UInt32]) -> Bool {
+        for shift in stride(from: 0, through: 48, by: 16) {
+            let slice = (value >> UInt64(shift)) & 0xFFFF
+            if slice != 0, !parts.contains(where: { $0.1 == shift }) { return false }
+        }
+        for (at, shift) in parts {
+            guard at >= 0, at < words.count else { return false }
+            let slice = UInt32((value >> UInt64(shift)) & 0xFFFF)
+            if shift == 0 {
+                words[at] = 0xD280_0000 | slice << 5 | rd
+            } else {
+                words[at] = 0xF280_0000 | UInt32(shift / 16) << 21 | slice << 5 | rd
+            }
+        }
+        return true
     }
 }
